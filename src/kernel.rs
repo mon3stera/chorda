@@ -1,6 +1,6 @@
 //! The kernel: registries for fibers, realms, pending plugins, and events.
 
-use std::any::Any;
+use std::any::{Any, TypeId};
 use std::collections::{HashMap, VecDeque};
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
@@ -25,12 +25,37 @@ pub(crate) struct PendingEntry {
     pub plugin: Arc<dyn Plugin>,
 }
 
+/// Which handler family a registration belongs to; each dispatch mode reads
+/// exactly one family.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum EventKind {
+    /// Async observers, served by `emit` and `parallel`.
+    Observer,
+    /// Synchronous deciders, served by `bail`.
+    Bail,
+    /// Async deciders, served by `serial`.
+    Serial,
+    /// Onion layers, served by `waterfall`.
+    Waterfall,
+}
+
+/// One handler family for one event type, plus the decision type where the
+/// family produces one. The registry key; the dispatch site knows all three.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct EventKey {
+    pub kind: EventKind,
+    pub event: TypeId,
+    pub result: Option<TypeId>,
+}
+
 #[derive(Clone)]
 pub(crate) struct EventHandler {
     pub realm: RealmId,
     pub fiber: FiberId,
     pub id: u64,
-    pub run: crate::events::ErasedHandler,
+    /// The typed handler box; the dispatch site knows the concrete type and
+    /// downcasts, mirroring [`PipelineHandler`].
+    pub body: Arc<dyn std::any::Any + Send + Sync>,
 }
 
 /// A registered middleware on a [`crate::pipeline::Pipeline`] extension
@@ -158,7 +183,7 @@ pub(crate) struct KernelInner {
     fibers: Mutex<HashMap<FiberId, Arc<FiberShared>>>,
     realms: Mutex<HashMap<RealmId, RealmNode>>,
     pending: Mutex<Vec<PendingEntry>>,
-    events: Mutex<HashMap<std::any::TypeId, Vec<EventHandler>>>,
+    events: Mutex<HashMap<EventKey, Vec<EventHandler>>>,
     pipelines: Mutex<HashMap<std::any::TypeId, Vec<PipelineHandler>>>,
     /// Woken on every transition that may change kernel idleness: fiber
     /// state changes, pending queue changes, and task claims/completions.
@@ -469,36 +494,32 @@ impl KernelInner {
         }
     }
 
-    pub(crate) fn add_handler(&self, type_id: std::any::TypeId, handler: EventHandler) {
+    pub(crate) fn add_handler(&self, key: EventKey, handler: EventHandler) {
         self.events
             .lock()
             .expect("events lock poisoned")
-            .entry(type_id)
+            .entry(key)
             .or_default()
             .push(handler);
     }
 
-    pub(crate) fn remove_handler(&self, type_id: std::any::TypeId, id: u64) {
+    pub(crate) fn remove_handler(&self, key: EventKey, id: u64) {
         if let Some(handlers) = self
             .events
             .lock()
             .expect("events lock poisoned")
-            .get_mut(&type_id)
+            .get_mut(&key)
         {
             handlers.retain(|handler| handler.id != id);
         }
     }
 
-    /// Returns handlers for an event type that are bound to `realm` or any
+    /// Returns handlers for one event family that are bound to `realm` or any
     /// of its ancestors, ordered from the innermost realm outward.
-    pub(crate) fn handlers_for(
-        &self,
-        type_id: std::any::TypeId,
-        realm: RealmId,
-    ) -> Vec<EventHandler> {
+    pub(crate) fn handlers_for(&self, key: EventKey, realm: RealmId) -> Vec<EventHandler> {
         let chain = self.realm_chain(realm);
         let events = self.events.lock().expect("events lock poisoned");
-        let Some(handlers) = events.get(&type_id) else {
+        let Some(handlers) = events.get(&key) else {
             return Vec::new();
         };
 

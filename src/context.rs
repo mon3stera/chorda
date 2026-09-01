@@ -8,7 +8,6 @@ use std::sync::atomic::Ordering;
 
 use tokio::task::JoinHandle;
 
-use crate::events::HandlerId;
 use crate::fiber::{
     DoneSignal, FiberHandle, FiberId, ProvidedService, State, TaskGuard, TaskKind, dispose_fiber,
 };
@@ -287,17 +286,5 @@ impl Ctx {
         self.kernel.activity.notify_waiters();
 
         Some(join)
-    }
-
-    /// Registers an event handler scoped to the current fiber. The handler
-    /// receives a clone of each emitted event and is removed automatically
-    /// when the fiber is disposed. See [`crate::events`].
-    pub fn on<E, F, Fut>(&self, handler: F) -> HandlerId
-    where
-        E: Clone + Send + Sync + 'static,
-        F: Fn(E) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = ()> + Send + 'static,
-    {
-        HandlerId::register(self, handler)
     }
 }

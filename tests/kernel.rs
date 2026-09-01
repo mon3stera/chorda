@@ -6,7 +6,7 @@ use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use nodus::{Ctx, FiberId, Kernel, Plugin, ServiceKey, State, fn_plugin};
+use nodus::{Ctx, EventNext, FiberId, Kernel, Plugin, ServiceKey, State, fn_plugin};
 
 type Shared<T> = Arc<StdMutex<T>>;
 
@@ -368,11 +368,11 @@ async fn events_reach_scoped_handlers_and_die_with_the_fiber() {
     let fiber = root.register(listener);
     fiber.wait_ready().await.unwrap();
 
-    root.emit(&Message("before")).await;
+    root.events().parallel(&Message("before")).await.unwrap();
     assert_eq!(*received.lock().unwrap(), vec!["before"]);
 
     fiber.dispose().await;
-    root.emit(&Message("after")).await;
+    root.events().parallel(&Message("after")).await.unwrap();
 
     assert_eq!(
         *received.lock().unwrap(),
@@ -413,7 +413,7 @@ async fn events_emitted_in_a_realm_bubble_up_to_ancestor_handlers() {
         });
     }
 
-    root.emit(&Message("from-root")).await;
+    root.events().parallel(&Message("from-root")).await.unwrap();
 
     assert_eq!(*parent_saw.lock().unwrap(), vec!["from-root"]);
     assert!(
@@ -421,7 +421,11 @@ async fn events_emitted_in_a_realm_bubble_up_to_ancestor_handlers() {
         "parent emits must not reach child handlers"
     );
 
-    child.emit(&Message("from-child")).await;
+    child
+        .events()
+        .parallel(&Message("from-child"))
+        .await
+        .unwrap();
 
     assert_eq!(*child_saw.lock().unwrap(), vec!["from-child"]);
     assert_eq!(
@@ -963,4 +967,232 @@ async fn tasks_can_be_joined_individually_inside_a_plugin() {
 
     assert!(verified.load(Ordering::SeqCst));
     assert_eq!(fiber.task_count(), 0, "joined tasks leave the set");
+}
+
+#[tokio::test]
+async fn emit_returns_immediately_and_observers_run_detached() {
+    let kernel = Kernel::new();
+    let root = kernel.root_ctx();
+    let (seen_tx, mut seen_rx) = tokio::sync::mpsc::channel::<&'static str>(4);
+
+    root.on(move |event: Message| {
+        let seen_tx = seen_tx.clone();
+
+        async move {
+            seen_tx.send(event.0).await.unwrap();
+        }
+    });
+
+    root.emit(&Message("detached"));
+
+    assert!(
+        seen_rx.try_recv().is_err(),
+        "emit must not wait for its observers"
+    );
+
+    let seen = seen_rx.recv().await.expect("the detached observer ran");
+
+    assert_eq!(seen, "detached");
+}
+
+#[tokio::test]
+async fn parallel_awaits_every_observer_and_aggregates_panics() {
+    let kernel = Kernel::new();
+    let root = kernel.root_ctx();
+    let survived: Shared<Vec<&'static str>> = shared(Vec::new());
+
+    {
+        let survived = survived.clone();
+
+        root.on(move |event: Message| {
+            let survived = survived.clone();
+
+            async move {
+                survived.lock().unwrap().push(event.0);
+            }
+        });
+    }
+
+    root.on(|_event: Message| async {
+        panic!("observer exploded");
+    });
+
+    let outcome = root.events().parallel(&Message("boom")).await;
+
+    assert!(outcome.is_err(), "the panic must be reported");
+    assert_eq!(
+        *survived.lock().unwrap(),
+        vec!["boom"],
+        "a panicking peer must not stop the other observers"
+    );
+}
+
+#[tokio::test]
+async fn serial_stops_at_the_first_decision() {
+    let kernel = Kernel::new();
+    let root = kernel.root_ctx();
+    let consulted: Shared<Vec<&'static str>> = shared(Vec::new());
+
+    {
+        let consulted = consulted.clone();
+
+        root.on_serial(move |_event: Message| {
+            let consulted = consulted.clone();
+
+            async move {
+                consulted.lock().unwrap().push("first");
+                None::<&'static str>
+            }
+        });
+    }
+
+    {
+        let consulted = consulted.clone();
+
+        root.on_serial(move |_event: Message| {
+            let consulted = consulted.clone();
+
+            async move {
+                consulted.lock().unwrap().push("second");
+                Some("decided")
+            }
+        });
+    }
+
+    {
+        let consulted = consulted.clone();
+
+        root.on_serial(move |_event: Message| {
+            let consulted = consulted.clone();
+
+            async move {
+                consulted.lock().unwrap().push("third");
+                Some("unreached")
+            }
+        });
+    }
+
+    let decision = root
+        .events()
+        .serial::<Message, &'static str>(&Message("go"))
+        .await;
+
+    assert_eq!(decision, Some("decided"));
+    assert_eq!(
+        *consulted.lock().unwrap(),
+        vec!["first", "second"],
+        "dispatch stops at the first decision"
+    );
+}
+
+#[tokio::test]
+async fn bail_decides_without_awaiting() {
+    let kernel = Kernel::new();
+    let root = kernel.root_ctx();
+
+    root.on_bail(|event: &Message| (event.0 == "blocked").then_some("denied"));
+
+    let blocked = root.events().bail::<Message, &str>(&Message("blocked"));
+    let allowed = root.events().bail::<Message, &str>(&Message("allowed"));
+
+    assert_eq!(blocked, Some("denied"));
+    assert_eq!(allowed, None);
+}
+
+#[tokio::test]
+async fn deciders_die_with_their_fiber() {
+    let kernel = Kernel::new();
+    let root = kernel.root_ctx();
+
+    let guard = fn_plugin("guard", |ctx: Ctx| async move {
+        ctx.on_bail(|_event: &Message| Some("guarded"));
+
+        Ok(())
+    });
+
+    let fiber = root.register(guard);
+    fiber.wait_ready().await.unwrap();
+
+    assert_eq!(
+        root.events().bail::<Message, &str>(&Message("x")),
+        Some("guarded")
+    );
+
+    fiber.dispose().await;
+
+    assert_eq!(
+        root.events().bail::<Message, &str>(&Message("x")),
+        None,
+        "deciders must be removed with their fiber"
+    );
+}
+
+#[tokio::test]
+async fn waterfall_composes_around_the_builtin_and_can_veto() {
+    let kernel = Kernel::new();
+    let root = kernel.root_ctx();
+
+    root.on_waterfall(
+        |_event: Message, next: EventNext<Message, String>| async move {
+            let inner = next.run(_event).await;
+            format!("outer({inner})")
+        },
+    );
+
+    root.on_waterfall(
+        |_event: Message, next: EventNext<Message, String>| async move {
+            let inner = next.run(_event).await;
+            format!("inner({inner})")
+        },
+    );
+
+    let composed = root
+        .events()
+        .waterfall(&Message("go"), |_event: Message| async {
+            "core".to_owned()
+        })
+        .await;
+
+    assert_eq!(
+        composed, "outer(inner(core))",
+        "layers run outermost-first around the built-in behavior"
+    );
+
+    // A fresh kernel, where the vetoing layer is the outermost one: skipping
+    // `next` must cut off the whole chain, built-in behavior included.
+    let kernel = Kernel::new();
+    let root = kernel.root_ctx();
+
+    root.on_waterfall(
+        |_event: Message, _next: EventNext<Message, String>| async move { "vetoed".to_owned() },
+    );
+
+    let vetoed = root
+        .events()
+        .waterfall(&Message("go"), |_event: Message| async {
+            "core".to_owned()
+        })
+        .await;
+
+    assert_eq!(
+        vetoed, "vetoed",
+        "an outermost layer that skips next vetoes everything inside it"
+    );
+}
+
+#[tokio::test]
+async fn deciders_bubble_up_to_ancestor_realms() {
+    let kernel = Kernel::new();
+    let root = kernel.root_ctx();
+    let child = root.derive();
+
+    root.on_bail(|event: &Message| (event.0 == "escalate").then_some("handled-upstairs"));
+
+    let decision = child.events().bail::<Message, &str>(&Message("escalate"));
+
+    assert_eq!(
+        decision,
+        Some("handled-upstairs"),
+        "child dispatches must consult ancestor deciders"
+    );
 }

@@ -64,7 +64,7 @@ mod service;
 pub use anyhow;
 pub use async_trait::async_trait;
 pub use context::{Ctx, RealmId};
-pub use events::HandlerId;
+pub use events::{EventAggregate, EventNext, Events, HandlerId};
 pub use fiber::{FiberHandle, FiberId, State};
 pub use inventory;
 pub use kernel::Kernel;
