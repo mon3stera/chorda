@@ -1179,6 +1179,88 @@ async fn waterfall_composes_around_the_builtin_and_can_veto() {
         "an outermost layer that skips next vetoes everything inside it"
     );
 }
+struct Gate;
+
+impl nodus::Pipeline for Gate {
+    type Input = u8;
+
+    type Output = u8;
+
+    const NAME: &'static str = "test/gate";
+}
+
+#[tokio::test]
+async fn describe_renders_the_tree_services_and_families() {
+    use std::sync::Arc;
+
+    let kernel = Kernel::new();
+    let root = kernel.root_ctx();
+
+    let tool = fn_plugin("tool", |ctx: Ctx| async move {
+        ctx.provide(Arc::new(7_u32)).await;
+
+        ctx.on(|_event: Message| async {});
+
+        ctx.on_bail(|_event: &Message| -> Option<&'static str> { None });
+
+        ctx.middleware::<Gate, _, _>(|input, next| async move { next.run(input).await });
+
+        Ok(())
+    });
+
+    let fiber = root.register(tool);
+    fiber.wait_ready().await.unwrap();
+
+    let waiting =
+        fn_plugin("waiting", |_ctx: Ctx| async { Ok(()) }).inject(vec![ServiceKey::of::<String>()]);
+    root.register(waiting);
+
+    let report = kernel.describe();
+
+    assert!(report.contains("fiber \"root\" [Ready]"), "{report}");
+    assert!(report.contains("fiber \"tool\" [Ready]"), "{report}");
+    assert!(report.contains("provides: u32"), "{report}");
+    assert!(report.contains("events:"), "{report}");
+    assert!(report.contains("observer<"), "{report}");
+    assert!(report.contains("bail<"), "{report}");
+    assert!(report.contains("pipelines:"), "{report}");
+    assert!(
+        report.contains("test/gate \u{d7} 1 middleware(s)"),
+        "{report}"
+    );
+    assert!(report.contains("pending:"), "{report}");
+    assert!(
+        report.contains("\"waiting\" waits for [alloc::string::String]"),
+        "{report}"
+    );
+
+    kernel.dispose().await;
+}
+
+#[tokio::test]
+async fn describe_shows_child_fibers_nested_under_their_parent() {
+    let kernel = Kernel::new();
+    let root = kernel.root_ctx();
+
+    let parent = fn_plugin("parent", |ctx: Ctx| async move {
+        let child = fn_plugin("child", |_ctx: Ctx| async { Ok(()) });
+
+        let child_fiber = ctx.register(child);
+        child_fiber.wait_ready().await.unwrap();
+
+        Ok(())
+    });
+
+    let fiber = root.register(parent);
+    fiber.wait_ready().await.unwrap();
+
+    let report = kernel.describe();
+
+    assert!(report.contains("fiber \"parent\" [Ready]"), "{report}");
+    assert!(report.contains("\n    fiber \"child\" [Ready]"), "{report}");
+
+    kernel.dispose().await;
+}
 
 #[tokio::test]
 async fn deciders_bubble_up_to_ancestor_realms() {

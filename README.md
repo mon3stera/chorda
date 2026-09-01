@@ -82,6 +82,30 @@ Hosts that just want "run until told to stop" get
 [`Kernel::run_until`]: drive the kernel until a shutdown signal (or
 idleness), then dispose everything before returning.
 
+## Introspection
+
+[`Kernel::describe`](https://docs.rs/nodus) renders what a `nodus doctor`
+would print — everything the kernel knows, in one snapshot:
+
+```text
+fiber "root" [Ready]
+  fiber "tool" [Ready]
+    provides: h_tools::ToolSink
+  fiber "waiting" [Pending]
+pending:
+  "waiting" waits for [h_tools::Config]
+events:
+  bail<h_core::ToolCall, result bool> × 2
+pipelines:
+  h/agent/tool-gate × 3 middleware(s)
+```
+
+The fiber tree carries each fiber's state, injected and provided services,
+and tracked task counts; the event families include their dispatch modes
+and result types; pipelines show their middleware counts. Type and pipeline
+names are recorded at registration time, so a bare `TypeId` never shows up
+unlabeled.
+
 ## Events: five dispatch modes
 
 Handlers are registered on a fiber (`ctx.on`, `ctx.on_bail`, `ctx.on_serial`,

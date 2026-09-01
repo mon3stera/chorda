@@ -168,6 +168,17 @@ impl Kernel {
 
         self.dispose().await;
     }
+
+    /// Renders a human-readable snapshot of the kernel: the fiber tree with
+    /// each fiber's state, injected and provided services, task counts; the
+    /// pending plugins and the service keys they wait for; the event handler
+    /// families; and the pipeline chains. What a `nodus doctor` would print.
+    ///
+    /// Locks every registry for the duration of the render — fine for
+    /// diagnostics, not for calling on every hot-path iteration.
+    pub fn describe(&self) -> String {
+        self.inner.describe()
+    }
 }
 
 impl Default for Kernel {
@@ -185,6 +196,11 @@ pub(crate) struct KernelInner {
     pending: Mutex<Vec<PendingEntry>>,
     events: Mutex<HashMap<EventKey, Vec<EventHandler>>>,
     pipelines: Mutex<HashMap<std::any::TypeId, Vec<PipelineHandler>>>,
+    /// `std::any::type_name` of every event/result type seen at registration,
+    /// so [`Kernel::describe`] can print readable families for bare `TypeId`s.
+    type_names: Mutex<HashMap<std::any::TypeId, &'static str>>,
+    /// Pipeline marker name (`Pipeline::NAME`) per pipeline type.
+    pipeline_names: Mutex<HashMap<std::any::TypeId, String>>,
     /// Woken on every transition that may change kernel idleness: fiber
     /// state changes, pending queue changes, and task claims/completions.
     pub(crate) activity: tokio::sync::Notify,
@@ -201,6 +217,8 @@ impl KernelInner {
             pending: Mutex::new(Vec::new()),
             events: Mutex::new(HashMap::new()),
             pipelines: Mutex::new(HashMap::new()),
+            type_names: Mutex::new(HashMap::new()),
+            pipeline_names: Mutex::new(HashMap::new()),
             activity: tokio::sync::Notify::new(),
         };
 
@@ -492,6 +510,198 @@ impl KernelInner {
                 node.services.remove(key);
             }
         }
+    }
+
+    /// Records the human-readable name of a type that appears in the event
+    /// registry, for diagnostics.
+    pub(crate) fn note_type<E: 'static>(&self) {
+        self.type_names
+            .lock()
+            .expect("type names lock poisoned")
+            .entry(std::any::TypeId::of::<E>())
+            .or_insert_with(std::any::type_name::<E>);
+    }
+
+    /// Records a pipeline marker's name, for diagnostics.
+    pub(crate) fn note_pipeline<P: crate::pipeline::Pipeline>(&self) {
+        self.pipeline_names
+            .lock()
+            .expect("pipeline names lock poisoned")
+            .insert(std::any::TypeId::of::<P>(), P::NAME.to_owned());
+    }
+
+    /// Renders the diagnostic snapshot; see [`Kernel::describe`].
+    pub(crate) fn describe(&self) -> String {
+        let fibers = self.fibers.lock().expect("fibers lock poisoned");
+        let mut out = String::new();
+
+        self.describe_fiber(&fibers, FiberId::root(), 0, &mut out);
+        self.describe_pending(&mut out);
+        self.describe_events(&mut out);
+        self.describe_pipelines(&mut out);
+
+        out
+    }
+
+    fn describe_fiber(
+        &self,
+        fibers: &HashMap<FiberId, Arc<FiberShared>>,
+        id: FiberId,
+        depth: usize,
+        out: &mut String,
+    ) {
+        use std::fmt::Write as _;
+
+        let Some(shared) = fibers.get(&id) else {
+            return;
+        };
+
+        let indent = "  ".repeat(depth);
+        let state = *shared.state.borrow();
+
+        let _ = writeln!(out, "{indent}fiber \"{}\" [{state:?}]", shared.name);
+
+        let injected = shared.injected.lock().expect("injected lock poisoned");
+
+        if !injected.is_empty() {
+            let keys: Vec<String> = injected.iter().map(|key| key.to_string()).collect();
+
+            let _ = writeln!(out, "{indent}  injects: {}", keys.join(", "));
+        }
+
+        drop(injected);
+
+        let provides = shared.provides.lock().expect("provides lock poisoned");
+
+        if !provides.is_empty() {
+            let keys: Vec<String> = provides.iter().map(|entry| entry.key.to_string()).collect();
+
+            let _ = writeln!(out, "{indent}  provides: {}", keys.join(", "));
+        }
+
+        let tasks = shared.tasks.len();
+
+        if tasks > 0 {
+            let _ = writeln!(out, "{indent}  tasks: {tasks}");
+        }
+
+        let mut children: Vec<&Arc<FiberShared>> = fibers
+            .values()
+            .filter(|shared| shared.parent == id && shared.id != FiberId::root())
+            .collect();
+
+        children.sort_by(|a, b| a.name.cmp(&b.name));
+
+        for child in children {
+            self.describe_fiber(fibers, child.id, depth + 1, out);
+        }
+    }
+
+    fn describe_pending(&self, out: &mut String) {
+        use std::fmt::Write as _;
+
+        let pending = self.pending.lock().expect("pending lock poisoned");
+
+        if pending.is_empty() {
+            return;
+        }
+
+        let _ = writeln!(out, "pending:");
+
+        for entry in pending.iter() {
+            let wants: Vec<String> = entry
+                .plugin
+                .inject()
+                .iter()
+                .map(|key| key.to_string())
+                .collect();
+
+            let _ = writeln!(
+                out,
+                "  \"{}\" waits for [{}]",
+                entry.shared.name,
+                wants.join(", ")
+            );
+        }
+    }
+
+    fn describe_events(&self, out: &mut String) {
+        use std::fmt::Write as _;
+
+        let events = self.events.lock().expect("events lock poisoned");
+
+        if events.is_empty() {
+            return;
+        }
+
+        let mut lines: Vec<String> = Vec::new();
+
+        for (key, handlers) in events.iter() {
+            let kind = match key.kind {
+                EventKind::Observer => "observer",
+                EventKind::Bail => "bail",
+                EventKind::Serial => "serial",
+                EventKind::Waterfall => "waterfall",
+            };
+
+            let event = self.type_name(key.event).unwrap_or("<unknown type>");
+
+            let result = key
+                .result
+                .and_then(|id| self.type_name(id))
+                .map(|name| format!(", result {name}"))
+                .unwrap_or_default();
+
+            lines.push(format!("  {kind}<{event}{result}> × {}", handlers.len()));
+        }
+
+        lines.sort();
+
+        let _ = writeln!(out, "events:");
+
+        for line in lines {
+            let _ = writeln!(out, "{line}");
+        }
+    }
+
+    fn describe_pipelines(&self, out: &mut String) {
+        use std::fmt::Write as _;
+
+        let pipelines = self.pipelines.lock().expect("pipelines lock poisoned");
+
+        if pipelines.is_empty() {
+            return;
+        }
+
+        let mut lines: Vec<String> = Vec::new();
+
+        for (type_id, handlers) in pipelines.iter() {
+            let name = self
+                .pipeline_names
+                .lock()
+                .expect("pipeline names lock poisoned")
+                .get(type_id)
+                .cloned()
+                .unwrap_or_else(|| "<unknown pipeline>".to_owned());
+
+            lines.push(format!("  {name} × {} middleware(s)", handlers.len()));
+        }
+
+        lines.sort();
+
+        let _ = writeln!(out, "pipelines:");
+
+        for line in lines {
+            let _ = writeln!(out, "{line}");
+        }
+    }
+
+    fn type_name(&self, id: std::any::TypeId) -> Option<&'static str> {
+        self.type_names
+            .lock()
+            .expect("type names lock poisoned")
+            .get(&id)
+            .copied()
     }
 
     pub(crate) fn add_handler(&self, key: EventKey, handler: EventHandler) {

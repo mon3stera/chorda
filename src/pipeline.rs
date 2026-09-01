@@ -155,6 +155,8 @@ where
     F: Fn(P::Input, Next<P>) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = P::Output> + Send + 'static,
 {
+    ctx.kernel.note_pipeline::<P>();
+
     let id = ctx.kernel.alloc_handler_id();
     let type_id = TypeId::of::<P>();
 

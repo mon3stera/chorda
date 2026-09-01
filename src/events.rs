@@ -418,6 +418,8 @@ impl Ctx {
         F: Fn(E) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
+        self.kernel.note_type::<E>();
+
         let run: ObserverRun<E> = Arc::new(move |event| Box::pin(handler(event)));
 
         register(self, observer_key::<E>(), Arc::new(ObserverBox { run }))
@@ -432,6 +434,9 @@ impl Ctx {
         R: Send + 'static,
         F: Fn(&E) -> Option<R> + Send + Sync + 'static,
     {
+        self.kernel.note_type::<E>();
+        self.kernel.note_type::<R>();
+
         let run: BailRun<E, R> = Arc::new(handler);
 
         register(
@@ -451,6 +456,9 @@ impl Ctx {
         F: Fn(E) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Option<R>> + Send + 'static,
     {
+        self.kernel.note_type::<E>();
+        self.kernel.note_type::<R>();
+
         let run: SerialRun<E, R> = Arc::new(move |event| Box::pin(handler(event)));
 
         register(
@@ -470,6 +478,9 @@ impl Ctx {
         F: Fn(E, EventNext<E, R>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = R> + Send + 'static,
     {
+        self.kernel.note_type::<E>();
+        self.kernel.note_type::<R>();
+
         let run: WaterfallRun<E, R> = Arc::new(move |event, next| Box::pin(handler(event, next)));
 
         register(
