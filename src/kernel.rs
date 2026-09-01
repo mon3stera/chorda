@@ -1,7 +1,7 @@
 //! The kernel: registries for fibers, realms, pending plugins, and events.
 
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -31,6 +31,18 @@ pub(crate) struct EventHandler {
     pub fiber: FiberId,
     pub id: u64,
     pub run: crate::events::ErasedHandler,
+}
+
+/// A registered middleware on a [`crate::pipeline::Pipeline`] extension
+/// point. The handler is type-erased; the dispatch site knows the point
+/// type and downcasts.
+#[derive(Clone)]
+pub(crate) struct PipelineHandler {
+    pub realm: RealmId,
+    pub fiber: FiberId,
+    pub id: u64,
+    pub prepend: bool,
+    pub handler: Arc<dyn std::any::Any + Send + Sync>,
 }
 
 /// A Cordis-style plugin kernel: fibers, realm-scoped services, and scoped
@@ -147,6 +159,7 @@ pub(crate) struct KernelInner {
     realms: Mutex<HashMap<RealmId, RealmNode>>,
     pending: Mutex<Vec<PendingEntry>>,
     events: Mutex<HashMap<std::any::TypeId, Vec<EventHandler>>>,
+    pipelines: Mutex<HashMap<std::any::TypeId, Vec<PipelineHandler>>>,
     /// Woken on every transition that may change kernel idleness: fiber
     /// state changes, pending queue changes, and task claims/completions.
     pub(crate) activity: tokio::sync::Notify,
@@ -162,6 +175,7 @@ impl KernelInner {
             realms: Mutex::new(HashMap::new()),
             pending: Mutex::new(Vec::new()),
             events: Mutex::new(HashMap::new()),
+            pipelines: Mutex::new(HashMap::new()),
             activity: tokio::sync::Notify::new(),
         };
 
@@ -490,6 +504,119 @@ impl KernelInner {
             .iter()
             .filter(|handler| chain.contains(&handler.realm))
             .cloned()
+            .collect()
+    }
+
+    pub(crate) fn add_pipeline(&self, type_id: std::any::TypeId, handler: PipelineHandler) {
+        self.pipelines
+            .lock()
+            .expect("pipelines lock poisoned")
+            .entry(type_id)
+            .or_default()
+            .push(handler);
+    }
+
+    pub(crate) fn remove_pipeline(&self, type_id: std::any::TypeId, id: u64) {
+        if let Some(entries) = self
+            .pipelines
+            .lock()
+            .expect("pipelines lock poisoned")
+            .get_mut(&type_id)
+        {
+            entries.retain(|entry| entry.id != id);
+        }
+    }
+
+    /// The vertical slice of realms a dispatch from `realm` reaches: its
+    /// ancestors (root first), itself, then all descendant realms breadth
+    /// first. The position in this list is the onion's realm order —
+    /// global middlewares (root) wrap outermost, session-specific ones run
+    /// innermost, closest to the built-in behavior.
+    pub(crate) fn pipeline_slice(&self, realm: RealmId) -> HashMap<RealmId, usize> {
+        let mut order = HashMap::new();
+        let mut ancestors: Vec<_> = self.realm_chain(realm);
+
+        ancestors.reverse();
+
+        for (index, ancestor) in ancestors.into_iter().enumerate() {
+            order.insert(ancestor, index);
+        }
+
+        let mut next_index = order.len();
+        let mut queue = VecDeque::from([realm]);
+
+        while let Some(current) = queue.pop_front() {
+            let mut children: Vec<RealmId> = {
+                let realms = self.realms.lock().expect("realms lock poisoned");
+
+                realms
+                    .iter()
+                    .filter(|(_, node)| node.parent == Some(current))
+                    .map(|(id, _)| *id)
+                    .collect()
+            };
+
+            children.sort_by_key(|id| id.0);
+
+            for child in children {
+                if order.contains_key(&child) {
+                    continue;
+                }
+
+                order.insert(child, next_index);
+                next_index += 1;
+                queue.push_back(child);
+            }
+        }
+
+        order
+    }
+
+    /// The snapshot of middlewares for a pipeline dispatch from `realm`,
+    /// ordered outermost first: realms in slice order (depth ascending),
+    /// prepends newest first, then appends in registration order.
+    pub(crate) fn pipeline_chain<P: crate::pipeline::Pipeline>(
+        &self,
+        realm: RealmId,
+    ) -> Vec<crate::pipeline::SharedRun<P>> {
+        let order = self.pipeline_slice(realm);
+        let entries = {
+            let pipelines = self.pipelines.lock().expect("pipelines lock poisoned");
+
+            pipelines
+                .get(&std::any::TypeId::of::<P>())
+                .cloned()
+                .unwrap_or_default()
+        };
+
+        let mut selected: Vec<(usize, PipelineHandler)> = entries
+            .into_iter()
+            .filter_map(|entry| order.get(&entry.realm).map(|index| (*index, entry)))
+            .filter(|(_, entry)| self.is_active(entry.fiber))
+            .collect();
+
+        selected.sort_by(|(a_order, a), (b_order, b)| {
+            a_order
+                .cmp(b_order)
+                .then_with(|| match (a.prepend, b.prepend) {
+                    (true, true) => b.id.cmp(&a.id),
+                    (false, false) => a.id.cmp(&b.id),
+                    (true, false) => std::cmp::Ordering::Less,
+                    (false, true) => std::cmp::Ordering::Greater,
+                })
+        });
+
+        selected
+            .into_iter()
+            .map(|(_, entry)| {
+                let boxed = entry
+                    .handler
+                    .clone()
+                    .downcast::<crate::pipeline::MiddlewareBox<P>>()
+                    .expect("middleware type mismatch");
+
+                Arc::clone(&boxed.run)
+            })
             .collect()
     }
 
