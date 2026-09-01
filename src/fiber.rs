@@ -242,6 +242,10 @@ pub(crate) struct FiberShared {
     pub setup: Mutex<Option<tokio::task::AbortHandle>>,
     /// Tasks spawned through the fiber's context.
     pub tasks: Arc<TaskSet>,
+    /// The formatted setup-error chain, kept so `wait_ready` can surface the
+    /// real cause. Stored as text because `anyhow::Error` cannot be cloned
+    /// back out of an `Arc`.
+    pub failure: Mutex<Option<String>>,
     /// Cleanup futures, executed last-in-first-out on disposal.
     pub disposables: Mutex<Vec<Disposable>>,
     /// Dependency keys that were satisfied when the fiber started.
@@ -345,10 +349,15 @@ impl FiberHandle {
             match *receiver.borrow_and_update() {
                 State::Ready => return Ok(()),
                 State::Failed => {
-                    return Err(anyhow::anyhow!(
-                        "fiber `{}` failed during setup",
-                        self.shared.name
-                    ));
+                    let failure = self.shared.failure.lock().expect("failure lock poisoned");
+
+                    return match failure.as_ref() {
+                        Some(chain) => Err(anyhow::anyhow!("{chain}")),
+                        None => Err(anyhow::anyhow!(
+                            "fiber `{}` failed during setup",
+                            self.shared.name
+                        )),
+                    };
                 }
                 State::Disposed => {
                     return Err(anyhow::anyhow!(

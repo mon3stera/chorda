@@ -196,6 +196,7 @@ impl KernelInner {
             state,
             disposal_started: AtomicBool::new(false),
             setup: Mutex::new(None),
+            failure: Mutex::new(None),
             tasks: Arc::new(crate::fiber::TaskSet::new()),
             disposables: Mutex::new(Vec::new()),
             injected: Mutex::new(Vec::new()),
@@ -256,6 +257,7 @@ impl KernelInner {
             state,
             disposal_started: AtomicBool::new(false),
             setup: Mutex::new(None),
+            failure: Mutex::new(None),
             tasks: Arc::new(crate::fiber::TaskSet::new()),
             disposables: Mutex::new(Vec::new()),
             injected: Mutex::new(Vec::new()),
@@ -679,15 +681,22 @@ impl KernelInner {
                     kernel.activity.notify_waiters();
                 }
                 Ok(Err(error)) => {
-                    tracing::error!(fiber = %task_shared.name, %error, "plugin setup failed");
+                    let chain = format!("{error:#}");
+
+                    tracing::error!(fiber = %task_shared.name, error = chain, "plugin setup failed");
+
+                    *task_shared.failure.lock().expect("failure lock poisoned") = Some(chain);
+
                     dispose_fiber(kernel, task_shared, State::Failed).await;
                 }
                 Err(panic) => {
-                    tracing::error!(
-                        fiber = %task_shared.name,
-                        panic = panic_message(&panic),
-                        "plugin setup panicked"
-                    );
+                    let message = panic_message(&panic);
+
+                    tracing::error!(fiber = %task_shared.name, panic = message, "plugin setup panicked");
+
+                    *task_shared.failure.lock().expect("failure lock poisoned") =
+                        Some(format!("plugin setup panicked: {message}"));
+
                     dispose_fiber(kernel, task_shared, State::Failed).await;
                 }
             }
