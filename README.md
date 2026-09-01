@@ -23,6 +23,7 @@ glue afterthought.
 | [`Events`] | Five dispatch modes (below) over fiber-scoped handlers that bubble through ancestor realms. |
 | [`Pipeline`] | A typed onion middleware chain around an owner-defined extension point — the waterfall for interception points that can rewrite or veto. |
 | [`Ctx`] | A plugin's view of the kernel: register plugins, provide/get services, fork realms, spawn tracked tasks, register effects, dispatch events. |
+| [`Loader`] | Config-driven mounting: a tree of entries (stable id + plugin kind + config) reconciled against the running kernel — untouched entries survive a reload. |
 
 ## Quickstart
 
@@ -170,16 +171,52 @@ let kernel = Kernel::with_discovered_plugins();
 
 Registrations are sorted by name for deterministic startup.
 
+## The loader: config-driven mounting
+
+Where `register_plugin!` handles compile-time discovery, the
+[`Loader`](https://docs.rs/nodus) handles runtime composition. A plugin
+*kind* is a constructor from a config value (`ConfiguredPlugin`, with a
+JSON schema via `schemars`); an *entry* is one configured instance with a
+stable id:
+
+```rust,ignore
+let loader = Loader::new(&kernel);
+loader.register_entry_kind(entry_kind::<McpPlugin>("mcp"))?;
+
+loader.mount(EntryTree::from_json_str(r#"[
+    { "id": "mcp:fs", "plugin": "mcp",
+      "config": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "."] } }
+]"#)?).await?;
+
+// Later — a new tree replaces the mounted one:
+let report = loader.reconcile(new_tree).await?;
+// report: created / updated / removed / restarted / kept
+```
+
+Reconciliation diffs by id: added entries register, removed entries
+dispose (cascading through whatever they registered), changed entries
+dispose and re-register — and **untouched entries keep running**. Because
+startup order is irrelevant (reactive injection starts dependents whenever
+their dependencies appear), a flat id-sorted diff is a correct reload.
+Replacing one entry's config tears down its dependents — service
+revocation is kernel semantics — so the pass re-registers those casualties
+against the replacement services instead of letting them die silently.
+
+Dynamic code loading is deliberately out of scope: entries reference
+compiled-in kinds, so only instances are dynamic and the Rust ABI problem
+never arises.
+
 ## Status
 
-In production use as h's kernel. Deliberately not built yet: a runtime
-plugin loader (EntryTree, config-driven mounts, HMR), supervision/restart
-policies for failed fibers, and per-scope event isolation. Known sharp
-edges: `wait_ready` blocks indefinitely on a `Pending` fiber (no timeout
-variant yet), and a failed fiber stays dead — nothing auto-restarts it.
+In production use as h's kernel. Deliberately not built yet: nested entry
+groups and patch-layer composition for the loader (flat id-keyed trees
+only), config-file watching (HMR on save), supervision/restart policies for
+failed fibers, and per-scope event isolation. Known sharp edges:
+`wait_ready` blocks indefinitely on a `Pending` fiber (no timeout variant
+yet), and a failed fiber stays dead — nothing auto-restarts it.
 
 ## Testing
 
-`cargo test` runs 47 tests, including a two-plugin workspace
+`cargo test` runs 57 tests, including a two-plugin workspace
 (`tests/crates/plugin-alpha`, `plugin-beta`) that exercises compile-time
 discovery end to end.

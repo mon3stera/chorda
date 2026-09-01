@@ -1,0 +1,632 @@
+//! Declarative mounting of plugin instances: the [`EntryTree`] and the
+//! [`Loader`] that reconciles it against the running kernel.
+//!
+//! The model, in one paragraph: a plugin *kind* is a compiled-in constructor
+//! from a config value to a [`Plugin`] (see [`ConfiguredPlugin`]); an *entry*
+//! is one configured instance of a kind with a **stable id**; an
+//! [`EntryTree`] is the serialized set of entries — the host's config file.
+//! [`Loader::mount`] registers a fiber per enabled entry, and
+//! [`Loader::reconcile`] diffs a new tree against the mounted one: entries
+//! absent from the new tree are disposed, changed entries are disposed and
+//! re-registered, and **untouched entries keep running**. Startup order is
+//! irrelevant — reactive injection starts dependents whenever their
+//! dependencies appear — so a flat, id-sorted diff is enough for a correct
+//! reload. This is the cordis-loader contract (stable entry ids, config
+//! updates, enable/disable, non-disruptive reload) with the dynamic code
+//! loading replaced by compiled-in kinds: the ABI problem never arises,
+//! because only instances are dynamic, never code.
+//!
+//! # Example
+//!
+//! ```
+//! use std::sync::Arc;
+//!
+//! use serde::Deserialize;
+//!
+//! use nodus::{ConfiguredPlugin, Ctx, Loader, Kernel, Plugin, entry_kind};
+//!
+//! struct Echo {
+//!     prefix: String,
+//! }
+//!
+//! #[derive(Deserialize, schemars::JsonSchema)]
+//! struct EchoConfig {
+//!     prefix: String,
+//! }
+//!
+//! # #[nodus::async_trait]
+//! impl Plugin for Echo {
+//!     fn name(&self) -> &str {
+//!         "echo"
+//!     }
+//!
+//!     async fn apply(&self, ctx: Ctx) -> nodus::anyhow::Result<()> {
+//!         ctx.provide(Arc::new(self.prefix.clone())).await;
+//!
+//!         Ok(())
+//!     }
+//! }
+//!
+//! impl ConfiguredPlugin for Echo {
+//!     type Config = EchoConfig;
+//!
+//!     fn build(config: EchoConfig) -> Self {
+//!         Self { prefix: config.prefix }
+//!     }
+//! }
+//!
+//! # #[tokio::main(flavor = "current_thread")]
+//! # async fn main() -> nodus::anyhow::Result<()> {
+//! let kernel = Kernel::new();
+//! let loader = Loader::new(&kernel);
+//!
+//! loader.register_entry_kind(entry_kind::<Echo>("echo"))?;
+//!
+//! let tree = nodus::EntryTree::from_json_str(
+//!     r#"[{ "id": "greeter", "plugin": "echo",
+//!          "config": { "prefix": "hello" } }]"#,
+//! )?;
+//!
+//! loader.mount(tree).await?;
+//! loader.fiber_of("greeter").unwrap().wait_ready().await?;
+//! assert_eq!(*kernel.root_ctx().get::<String>().unwrap(), "hello");
+//!
+//! kernel.dispose().await;
+//! # Ok(())
+//! # }
+//! ```
+
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
+
+use anyhow::{Context as _, bail};
+use serde::Deserialize;
+use serde_json::Value;
+
+use crate::{
+    Kernel,
+    fiber::{FiberHandle, State},
+    plugin::Plugin,
+};
+
+/// A plugin that can be instantiated from one config value — the constructor
+/// half of a loader entry kind.
+///
+/// The config type doubles as the kind's JSON schema (via [`schemars`]),
+/// which the loader validates every entry's config against before mounting.
+pub trait ConfiguredPlugin: Plugin + Sized + 'static {
+    /// The entry's configuration, deserialized from the entry's `config`
+    /// value; an absent config is presented as an empty object.
+    type Config: serde::de::DeserializeOwned + schemars::JsonSchema + Send;
+
+    /// Builds the plugin from validated configuration. Pure construction:
+    /// the loader may call it again on re-registration.
+    fn build(config: Self::Config) -> Self;
+}
+
+/// Validates one config value against a kind's config type.
+type ConfigCheck = Arc<dyn Fn(&Value) -> anyhow::Result<()> + Send + Sync>;
+
+/// Builds one plugin instance from a config value.
+type ConfigBuild = Arc<dyn Fn(&Value) -> anyhow::Result<Arc<dyn Plugin>> + Send + Sync>;
+
+/// One compiled-in plugin kind: a name plus a constructor from config.
+///
+/// Created with [`entry_kind`] and registered on a [`Loader`].
+#[derive(Clone)]
+pub struct EntryKind {
+    name: String,
+    schema: schemars::Schema,
+    validate: ConfigCheck,
+    build: ConfigBuild,
+}
+
+impl EntryKind {
+    /// The kind's registered name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The JSON schema of this kind's config — useful for hosts that
+    /// generate config documentation or editor completions.
+    pub fn schema(&self) -> &schemars::Schema {
+        &self.schema
+    }
+}
+
+/// Creates an entry kind from a [`ConfiguredPlugin`] implementation.
+pub fn entry_kind<K: ConfiguredPlugin>(name: impl Into<String>) -> EntryKind {
+    let name = name.into();
+    let kind_name = name.clone();
+    let build_name = name.clone();
+
+    EntryKind {
+        schema: schemars::schema_for!(K::Config),
+        validate: Arc::new(move |value| {
+            serde_json::from_value::<K::Config>(value.clone())
+                .with_context(|| format!("invalid config for kind \"{kind_name}\""))?;
+
+            Ok(())
+        }),
+        build: Arc::new(move |value| {
+            let config: K::Config = serde_json::from_value(value.clone())
+                .with_context(|| format!("invalid config for kind \"{build_name}\""))?;
+
+            Ok(Arc::new(K::build(config)) as Arc<dyn Plugin>)
+        }),
+        name,
+    }
+}
+
+/// One serialized entry row: `id`, `plugin`, optional `config`, `disabled`.
+///
+/// This is the on-disk shape — an [`EntryTree`] is an array of these.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct EntrySpec {
+    /// Stable identity inside the tree; the unit of reconciliation.
+    pub id: String,
+
+    /// The plugin kind's registered name.
+    pub plugin: String,
+
+    /// The instance's configuration; absent means an empty object.
+    #[serde(default)]
+    pub config: Option<Value>,
+
+    /// Disabled entries stay declared but mount no fiber.
+    #[serde(default)]
+    pub disabled: bool,
+}
+
+/// The declarative mounting tree: a set of uniquely identified entries.
+///
+/// Entries are kept sorted by id so mounts and reloads are deterministic.
+/// Nesting (groups, parent-child ids) is deliberately not modeled yet.
+#[derive(Debug, Clone, Default)]
+pub struct EntryTree {
+    entries: BTreeMap<String, EntrySpec>,
+}
+
+impl EntryTree {
+    /// Builds a tree from a JSON array of entry rows, validating the shape:
+    /// rows deserialize, ids are unique and non-empty. Kind and config
+    /// validation happens on the [`Loader`], which owns the kinds.
+    pub fn from_value(value: Value) -> anyhow::Result<Self> {
+        let Value::Array(rows) = value else {
+            bail!("an entry tree is an array of entry rows");
+        };
+
+        let mut entries = BTreeMap::new();
+
+        for row in rows {
+            let spec: EntrySpec = serde_json::from_value(row).context("invalid entry row")?;
+
+            if spec.id.is_empty() {
+                bail!("entry ids must be non-empty");
+            }
+
+            if entries.contains_key(&spec.id) {
+                bail!("duplicate entry id \"{}\"", spec.id);
+            }
+
+            entries.insert(spec.id.clone(), spec);
+        }
+
+        Ok(Self { entries })
+    }
+
+    /// Builds a tree from a JSON document — an array of entry rows.
+    pub fn from_json_str(json: &str) -> anyhow::Result<Self> {
+        let value: Value = serde_json::from_str(json).context("invalid entry tree document")?;
+
+        Self::from_value(value)
+    }
+
+    /// The entries in id order.
+    pub fn entries(&self) -> impl Iterator<Item = &EntrySpec> {
+        self.entries.values()
+    }
+
+    fn get(&self, id: &str) -> Option<&EntrySpec> {
+        self.entries.get(id)
+    }
+}
+
+/// The registry of compiled-in plugin kinds a [`Loader`] mounts from.
+#[derive(Default)]
+pub struct EntryKinds {
+    kinds: BTreeMap<String, EntryKind>,
+}
+
+impl EntryKinds {
+    /// Registers a kind. A duplicate kind name is an error.
+    pub fn register(&mut self, kind: EntryKind) -> anyhow::Result<()> {
+        if self.kinds.contains_key(&kind.name) {
+            bail!("entry kind \"{}\" is already registered", kind.name);
+        }
+
+        self.kinds.insert(kind.name.clone(), kind);
+
+        Ok(())
+    }
+
+    pub(crate) fn get(&self, name: &str) -> Option<&EntryKind> {
+        self.kinds.get(name)
+    }
+
+    /// The registered kind names, sorted.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.kinds.keys().map(String::as_str)
+    }
+}
+
+/// What one [`Loader::reconcile`] pass did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LoaderReport {
+    /// Entries whose fibers were created.
+    pub created: Vec<String>,
+    /// Entries disposed and re-registered because their options changed.
+    pub updated: Vec<String>,
+    /// Entries disposed because they disappeared from the new tree (or were
+    /// disabled).
+    pub removed: Vec<String>,
+    /// Kept entries whose fiber was disposed as a *side effect* of the pass
+    /// — a replaced dependency disconnects its dependents — and were
+    /// therefore re-registered against the replacement services. Fibers
+    /// that failed on their own (`State::Failed`) are never restarted.
+    pub restarted: Vec<String>,
+    /// Entries left untouched: same id and same options.
+    pub kept: usize,
+}
+
+/// One mounted entry: its serialized options plus the live fiber.
+#[derive(Clone)]
+struct Mounted {
+    options: EntrySpec,
+    fiber: FiberHandle,
+}
+
+/// The runtime side of the loader: entry kinds, mounted fibers, and the
+/// reconciliation that keeps the mounted set matching a tree.
+///
+/// Entries register through the kernel's root context, so every entry fiber
+/// is a child of the root; disposing an entry cascades through whatever its
+/// plugin registered.
+pub struct Loader {
+    kernel: Kernel,
+    kinds: Mutex<EntryKinds>,
+    mounted: Mutex<BTreeMap<String, Mounted>>,
+}
+
+impl Loader {
+    /// Creates a loader over a kernel.
+    pub fn new(kernel: &Kernel) -> Self {
+        Self {
+            kernel: kernel.clone(),
+            kinds: Mutex::new(EntryKinds::default()),
+            mounted: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// Registers a plugin kind this loader can mount. Must happen before
+    /// the first [`Loader::mount`] or [`Loader::reconcile`]; a duplicate
+    /// kind name is an error.
+    pub fn register_entry_kind(&self, kind: EntryKind) -> anyhow::Result<()> {
+        self.kinds
+            .lock()
+            .expect("kinds lock poisoned")
+            .register(kind)
+    }
+
+    /// The registered kind names, sorted.
+    pub fn kind_names(&self) -> Vec<String> {
+        self.kinds
+            .lock()
+            .expect("kinds lock poisoned")
+            .names()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// The ids of currently mounted entries, in id order.
+    pub fn mounted_ids(&self) -> Vec<String> {
+        self.mounted
+            .lock()
+            .expect("mounted lock poisoned")
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    /// The fiber of one mounted entry.
+    pub fn fiber_of(&self, id: &str) -> Option<FiberHandle> {
+        self.mounted
+            .lock()
+            .expect("mounted lock poisoned")
+            .get(id)
+            .map(|mounted| mounted.fiber.clone())
+    }
+
+    /// Mounts every enabled entry of a fresh tree.
+    ///
+    /// All entries are validated against the kinds first — an invalid tree
+    /// mounts nothing. Registration itself happens per entry, in id order.
+    pub async fn mount(&self, tree: EntryTree) -> anyhow::Result<Vec<String>> {
+        if !self
+            .mounted
+            .lock()
+            .expect("mounted lock poisoned")
+            .is_empty()
+        {
+            bail!("the loader already has entries mounted; use reconcile");
+        }
+
+        let specs = self.validate_against_kinds(&tree)?;
+
+        let mut mounted_ids = Vec::new();
+
+        for spec in specs {
+            let fiber = self.register_entry(&spec)?;
+
+            self.mounted.lock().expect("mounted lock poisoned").insert(
+                spec.id.clone(),
+                Mounted {
+                    options: spec.clone(),
+                    fiber,
+                },
+            );
+
+            mounted_ids.push(spec.id);
+        }
+
+        Ok(mounted_ids)
+    }
+
+    /// Brings the mounted set in line with `next`: creates missing entries,
+    /// disposes removed ones, and re-registers changed ones — untouched
+    /// entries keep running. Disabled transitions count as removals and
+    /// creations.
+    ///
+    /// Every changed entry is validated before anything is disposed, so an
+    /// invalid tree is a no-op. Disposal completes (effects, cascades)
+    /// before a replacement fiber registers; registration happens in id
+    /// order.
+    ///
+    /// Replacing one entry's config tears down its dependents — that is the
+    /// kernel's service-revocation semantics. The pass then re-registers
+    /// such collateral casualties against the replacement services, so an
+    /// untouched entry follows its dependency's new configuration instead
+    /// of dying silently; see [`LoaderReport::restarted`].
+    pub async fn reconcile(&self, next: EntryTree) -> anyhow::Result<LoaderReport> {
+        let mut report = LoaderReport::default();
+
+        let (kept, actions) = self.plan(&next)?;
+
+        report.kept = kept;
+        self.validate_actions(&actions)?;
+
+        for (id, action) in &actions {
+            match action {
+                Action::Create(spec) => {
+                    let fiber = self.register_entry(spec)?;
+
+                    self.mounted.lock().expect("mounted lock poisoned").insert(
+                        id.clone(),
+                        Mounted {
+                            options: spec.clone(),
+                            fiber,
+                        },
+                    );
+
+                    report.created.push(id.clone());
+                }
+                Action::Replace(spec, fiber) => {
+                    fiber.dispose().await;
+
+                    let new_fiber = self.register_entry(spec)?;
+
+                    self.mounted.lock().expect("mounted lock poisoned").insert(
+                        id.clone(),
+                        Mounted {
+                            options: spec.clone(),
+                            fiber: new_fiber,
+                        },
+                    );
+
+                    report.updated.push(id.clone());
+                }
+                Action::Remove(fiber) => {
+                    fiber.dispose().await;
+
+                    self.mounted
+                        .lock()
+                        .expect("mounted lock poisoned")
+                        .remove(id);
+
+                    report.removed.push(id.clone());
+                }
+                Action::Keep => {}
+            }
+        }
+
+        self.repair_collateral(&mut report).await?;
+
+        Ok(report)
+    }
+
+    /// Re-registers kept entries whose fiber was disposed as collateral of
+    /// the pass (a replaced or removed dependency disconnects its
+    /// dependents). Repeat until stable: re-registration can only wake
+    /// pending fibers, so this terminates. `State::Failed` fibers — a
+    /// plugin's own apply error — stay dead.
+    async fn repair_collateral(&self, report: &mut LoaderReport) -> anyhow::Result<()> {
+        loop {
+            let dead: Vec<(String, EntrySpec)> = {
+                let mounted = self.mounted.lock().expect("mounted lock poisoned");
+
+                mounted
+                    .iter()
+                    .filter(|(_, mounted)| mounted.fiber.state() == State::Disposed)
+                    .map(|(id, mounted)| (id.clone(), mounted.options.clone()))
+                    .collect()
+            };
+
+            if dead.is_empty() {
+                return Ok(());
+            }
+
+            for (id, spec) in dead {
+                let fiber = self.register_entry(&spec)?;
+
+                self.mounted.lock().expect("mounted lock poisoned").insert(
+                    id.clone(),
+                    Mounted {
+                        options: spec,
+                        fiber,
+                    },
+                );
+
+                report.restarted.push(id);
+            }
+        }
+    }
+
+    /// Decides, under the lock, what each id needs: keep, create, replace,
+    /// or remove. Fibers to dispose are cloned out; no lock is held across
+    /// an await.
+    fn plan(&self, next: &EntryTree) -> anyhow::Result<(usize, Vec<(String, Action)>)> {
+        let mounted = self.mounted.lock().expect("mounted lock poisoned");
+        let mut actions = Vec::new();
+        let mut kept = 0_usize;
+
+        let mut ids: Vec<&String> = next.entries.keys().collect();
+
+        for id in mounted.keys() {
+            if !next.entries.contains_key(id) {
+                ids.push(id);
+            }
+        }
+
+        ids.sort();
+
+        for id in ids {
+            let target = next.get(id);
+            let current = mounted.get(id);
+
+            match (current, target) {
+                (Some(mounted), Some(spec)) if !spec.disabled && &mounted.options == spec => {
+                    kept += 1;
+                    actions.push((id.clone(), Action::Keep));
+                }
+                // A disabled target unmounts whatever is there, mounted or not.
+                (Some(mounted), Some(spec)) if spec.disabled => {
+                    actions.push((id.clone(), Action::Remove(mounted.fiber.clone())));
+                }
+                (Some(mounted), Some(spec)) => {
+                    actions.push((
+                        id.clone(),
+                        Action::Replace(spec.clone(), mounted.fiber.clone()),
+                    ));
+                }
+                (Some(mounted), None) => {
+                    actions.push((id.clone(), Action::Remove(mounted.fiber.clone())));
+                }
+                (None, Some(spec)) if spec.disabled => {
+                    kept += 1;
+                    actions.push((id.clone(), Action::Keep));
+                }
+                (None, Some(spec)) => {
+                    actions.push((id.clone(), Action::Create(spec.clone())));
+                }
+                (None, None) => unreachable!("id came from one of the two trees"),
+            }
+        }
+
+        Ok((kept, actions))
+    }
+
+    /// Validates every entry the plan would mount: kind must exist and the
+    /// config must deserialize into the kind's config type. Runs before any
+    /// disposal, so an invalid tree cannot tear down a running one.
+    fn validate_actions(&self, actions: &[(String, Action)]) -> anyhow::Result<()> {
+        let kinds = self.kinds.lock().expect("kinds lock poisoned");
+
+        for (id, action) in actions {
+            let (Action::Create(spec) | Action::Replace(spec, _)) = action else {
+                continue;
+            };
+
+            validate_spec(&kinds, spec).with_context(|| format!("entry \"{id}\" is invalid"))?;
+        }
+
+        Ok(())
+    }
+
+    /// Validates a whole tree against the kinds; used by [`Loader::mount`].
+    fn validate_against_kinds(&self, tree: &EntryTree) -> anyhow::Result<Vec<EntrySpec>> {
+        let kinds = self.kinds.lock().expect("kinds lock poisoned");
+        let mut specs = Vec::new();
+
+        for spec in tree.entries() {
+            if spec.disabled {
+                continue;
+            }
+
+            validate_spec(&kinds, spec)
+                .with_context(|| format!("entry \"{}\" is invalid", spec.id))?;
+
+            specs.push(spec.clone());
+        }
+
+        Ok(specs)
+    }
+
+    fn register_entry(&self, spec: &EntrySpec) -> anyhow::Result<FiberHandle> {
+        let kind = self
+            .kinds
+            .lock()
+            .expect("kinds lock poisoned")
+            .get(&spec.plugin)
+            .with_context(|| {
+                format!(
+                    "entry \"{}\" uses unknown kind \"{}\"",
+                    spec.id, spec.plugin
+                )
+            })?
+            .clone();
+
+        let config = spec
+            .config
+            .clone()
+            .unwrap_or_else(|| Value::Object(Default::default()));
+        let plugin = (kind.build)(&config)
+            .with_context(|| format!("entry \"{}\" failed to build", spec.id))?;
+
+        Ok(self.kernel.root_ctx().register_shared(plugin))
+    }
+}
+
+fn validate_spec(kinds: &EntryKinds, spec: &EntrySpec) -> anyhow::Result<()> {
+    let kind = kinds
+        .get(&spec.plugin)
+        .with_context(|| format!("unknown kind \"{}\"", spec.plugin))?;
+
+    let config = spec
+        .config
+        .clone()
+        .unwrap_or_else(|| Value::Object(Default::default()));
+
+    (kind.validate)(&config)
+}
+
+/// What the plan decided for one id.
+enum Action {
+    Keep,
+    Create(EntrySpec),
+    /// The old fiber to dispose, and the options to re-register with.
+    Replace(EntrySpec, FiberHandle),
+    /// The fiber to dispose.
+    Remove(FiberHandle),
+}

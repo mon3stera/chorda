@@ -56,6 +56,7 @@ mod context;
 mod events;
 mod fiber;
 mod kernel;
+mod loader;
 mod pipeline;
 mod plugin;
 mod registry;
@@ -68,6 +69,9 @@ pub use events::{EventAggregate, EventNext, Events, HandlerId};
 pub use fiber::{FiberHandle, FiberId, State};
 pub use inventory;
 pub use kernel::Kernel;
+pub use loader::{
+    ConfiguredPlugin, EntryKind, EntryKinds, EntrySpec, EntryTree, Loader, LoaderReport, entry_kind,
+};
 pub use pipeline::{Next, Pipeline, PipelineId};
 pub use plugin::{FnPlugin, Plugin, fn_plugin};
 pub use registry::{PluginRegistration, discover_plugin_names, plugin_registrations};

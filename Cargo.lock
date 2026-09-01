@@ -200,6 +200,7 @@ dependencies = [
  "plugin-beta",
  "schemars",
  "serde",
+ "serde_json",
  "slotmap",
  "tokio",
  "tracing",
