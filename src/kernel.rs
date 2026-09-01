@@ -11,7 +11,7 @@ use futures::future::FutureExt;
 
 use crate::context::Ctx;
 use crate::context::RealmId;
-use crate::fiber::{FiberId, FiberShared, State, dispose_fiber, panic_message};
+use crate::fiber::{FiberHandle, FiberId, FiberShared, State, dispose_fiber, panic_message};
 use crate::plugin::Plugin;
 use crate::service::ServiceKey;
 
@@ -50,6 +50,27 @@ impl Kernel {
         Self {
             inner: Arc::new(KernelInner::new()),
         }
+    }
+
+    /// Creates a kernel and registers every plugin discovered through the
+    /// inventory registry. See [`crate::registry`].
+    pub fn with_discovered_plugins() -> Self {
+        let kernel = Self::new();
+        kernel.register_discovered();
+
+        kernel
+    }
+
+    /// Registers every discovered plugin on the root fiber and returns the
+    /// handles, sorted by plugin name. Missing dependencies leave the
+    /// plugins pending until something provides them.
+    pub fn register_discovered(&self) -> Vec<FiberHandle> {
+        let root = self.root_ctx();
+
+        crate::registry::plugin_registrations()
+            .into_iter()
+            .map(|registration| root.register_shared((registration.build)()))
+            .collect()
     }
 
     /// A context bound to the root fiber and root realm.

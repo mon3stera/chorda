@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "tests/crates/plugin-alpha", "tests/crates/plugin-beta"]
+resolver = "2"
+
 [package]
 name = "nodus"
 version = "0.1.0"
@@ -7,8 +11,13 @@ edition = "2024"
 anyhow = "1.0.104"
 async-trait = "0.1.92"
 futures = "0.3.34"
+inventory = "0.3.21"
 schemars = "1.2.2"
 serde = { version = "1.0.229", features = ["derive"] }
 slotmap = "1.1.1"
 tokio = { version = "1.53.1", features = ["full"] }
 tracing = "0.1.44"
+
+[dev-dependencies]
+plugin-alpha = { path = "tests/crates/plugin-alpha" }
+plugin-beta = { path = "tests/crates/plugin-beta" }

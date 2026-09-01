@@ -6,7 +6,10 @@
 //! handlers. A [`Plugin`] declares the services it injects and starts on its
 //! own fiber through [`Ctx::register`], which returns a [`FiberHandle`].
 //! Plugins whose dependencies are missing stay [`State::Pending`] and start
-//! automatically once [`Ctx::provide`] satisfies them. Tasks spawned through
+//! automatically once [`Ctx::provide`] satisfies them. Plugin crates can
+//! also submit themselves to a compile-time registry with
+//! [`register_plugin!`]; [`Kernel::with_discovered_plugins`] then registers
+//! whatever the host's binary linked in. Tasks spawned through
 //! [`Ctx::spawn`] are tracked: plain tasks are aborted at disposal, while
 //! tasks spawned with a termination signal ([`Ctx::spawn_graceful`]) are
 //! signalled and then awaited. Every effect registered with
@@ -54,11 +57,16 @@ mod events;
 mod fiber;
 mod kernel;
 mod plugin;
+mod registry;
 mod service;
 
+pub use anyhow;
+pub use async_trait::async_trait;
 pub use context::{Ctx, RealmId};
 pub use events::HandlerId;
 pub use fiber::{FiberHandle, FiberId, State};
+pub use inventory;
 pub use kernel::Kernel;
 pub use plugin::{FnPlugin, Plugin, fn_plugin};
+pub use registry::{PluginRegistration, discover_plugin_names, plugin_registrations};
 pub use service::ServiceKey;
