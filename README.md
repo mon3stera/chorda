@@ -202,21 +202,31 @@ Replacing one entry's config tears down its dependents — service
 revocation is kernel semantics — so the pass re-registers those casualties
 against the replacement services instead of letting them die silently.
 
+Rows may declare a `parent` group: groups are pure containers that mount
+no fiber, but their `disabled` flag cascades to every descendant — one
+flag retires a whole subtree. Trees are also stackable:
+`EntryTree::compose([base, user, overlay])` merges patch layers
+row-by-row by id (later layers win), the shape DSH uses for
+bundle defaults + user `cordis.patch.yml` + `--patch` overlays. And
+`to_json_str` serializes the effective tree back out, the write-back
+material for hosts that persist loader state.
+
 Dynamic code loading is deliberately out of scope: entries reference
 compiled-in kinds, so only instances are dynamic and the Rust ABI problem
 never arises.
 
 ## Status
 
-In production use as h's kernel. Deliberately not built yet: nested entry
-groups and patch-layer composition for the loader (flat id-keyed trees
-only), config-file watching (HMR on save), supervision/restart policies for
-failed fibers, and per-scope event isolation. Known sharp edges:
-`wait_ready` blocks indefinitely on a `Pending` fiber (no timeout variant
-yet), and a failed fiber stays dead — nothing auto-restarts it.
+In production use as h's kernel. Deliberately not built yet for the
+loader: config-file watching (HMR on save — the host watches and calls
+`reconcile`), write-back targeting a specific patch layer, supervision
+policies beyond the loader's collateral repair, and per-scope event
+isolation. Known sharp edges: `wait_ready` blocks indefinitely on a
+`Pending` fiber (no timeout variant yet), and a failed fiber stays dead —
+nothing auto-restarts it.
 
 ## Testing
 
-`cargo test` runs 57 tests, including a two-plugin workspace
+`cargo test` runs 63 tests, including a two-plugin workspace
 (`tests/crates/plugin-alpha`, `plugin-beta`) that exercises compile-time
 discovery end to end.

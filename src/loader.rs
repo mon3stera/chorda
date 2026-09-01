@@ -11,10 +11,14 @@
 //! re-registered, and **untouched entries keep running**. Startup order is
 //! irrelevant — reactive injection starts dependents whenever their
 //! dependencies appear — so a flat, id-sorted diff is enough for a correct
-//! reload. This is the cordis-loader contract (stable entry ids, config
-//! updates, enable/disable, non-disruptive reload) with the dynamic code
-//! loading replaced by compiled-in kinds: the ABI problem never arises,
-//! because only instances are dynamic, never code.
+//! reload. Rows may declare a `parent` group: groups are pure containers
+//! that mount no fiber, but disabling (or enabling) one cascades to every
+//! descendant, and [`EntryTree::compose`] stacks patch layers — a base
+//! document plus user patches overriding rows by id. This is the
+//! cordis-loader contract (stable entry ids, config updates,
+//! enable/disable, non-disruptive reload) with the dynamic code loading
+//! replaced by compiled-in kinds: the ABI problem never arises, because
+//! only instances are dynamic, never code.
 //!
 //! # Example
 //!
@@ -82,7 +86,7 @@ use std::{
 };
 
 use anyhow::{Context as _, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
@@ -160,24 +164,48 @@ pub fn entry_kind<K: ConfiguredPlugin>(name: impl Into<String>) -> EntryKind {
     }
 }
 
-/// One serialized entry row: `id`, `plugin`, optional `config`, `disabled`.
+/// One serialized entry row: `id`, optional `plugin`, optional `parent`,
+/// optional `config`, `disabled`.
 ///
-/// This is the on-disk shape — an [`EntryTree`] is an array of these.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+/// This is the on-disk shape — an [`EntryTree`] is an array of these. A row
+/// without a `plugin` is a **group**: a pure container that mounts no fiber
+/// but cascades its `disabled` flag onto every descendant. Hierarchy is
+/// expressed with `parent` references (flat unique ids, not path-encoded
+/// strings); a parent must be a group declared anywhere in the same tree.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EntrySpec {
     /// Stable identity inside the tree; the unit of reconciliation.
     pub id: String,
 
-    /// The plugin kind's registered name.
-    pub plugin: String,
+    /// The plugin kind's registered name; absent for group rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<String>,
 
-    /// The instance's configuration; absent means an empty object.
-    #[serde(default)]
+    /// The id of the group this entry belongs to, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+
+    /// The instance's configuration; absent means an empty object. Groups
+    /// must not carry a config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config: Option<Value>,
 
-    /// Disabled entries stay declared but mount no fiber.
-    #[serde(default)]
-    pub disabled: bool,
+    /// Disabled entries stay declared but mount no fiber; the flag cascades
+    /// down the parent chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled: Option<bool>,
+}
+
+impl EntrySpec {
+    /// An enabled entry or group.
+    pub fn enabled(&self) -> bool {
+        !self.disabled.unwrap_or(false)
+    }
+
+    /// Whether this row is a group container.
+    pub fn is_group(&self) -> bool {
+        self.plugin.is_none()
+    }
 }
 
 /// The declarative mounting tree: a set of uniquely identified entries.
@@ -190,9 +218,11 @@ pub struct EntryTree {
 }
 
 impl EntryTree {
-    /// Builds a tree from a JSON array of entry rows, validating the shape:
-    /// rows deserialize, ids are unique and non-empty. Kind and config
-    /// validation happens on the [`Loader`], which owns the kinds.
+    /// Builds a tree from a JSON array of entry rows, validating the
+    /// structure: rows deserialize, ids are unique and non-empty, parents
+    /// exist and are groups, parent chains are acyclic, groups carry no
+    /// config. Kind and config validation happens on the [`Loader`], which
+    /// owns the kinds.
     pub fn from_value(value: Value) -> anyhow::Result<Self> {
         let Value::Array(rows) = value else {
             bail!("an entry tree is an array of entry rows");
@@ -201,11 +231,7 @@ impl EntryTree {
         let mut entries = BTreeMap::new();
 
         for row in rows {
-            let spec: EntrySpec = serde_json::from_value(row).context("invalid entry row")?;
-
-            if spec.id.is_empty() {
-                bail!("entry ids must be non-empty");
-            }
+            let spec = parse_row(row)?;
 
             if entries.contains_key(&spec.id) {
                 bail!("duplicate entry id \"{}\"", spec.id);
@@ -214,7 +240,11 @@ impl EntryTree {
             entries.insert(spec.id.clone(), spec);
         }
 
-        Ok(Self { entries })
+        let tree = Self { entries };
+
+        tree.validate_structure()?;
+
+        Ok(tree)
     }
 
     /// Builds a tree from a JSON document — an array of entry rows.
@@ -224,9 +254,116 @@ impl EntryTree {
         Self::from_value(value)
     }
 
+    /// Composes a tree out of stacked layers, later layers overriding
+    /// earlier ones row-by-row by id. This is the patch-model of the cordis
+    /// loader: a base layer ships the defaults, a user layer overrides
+    /// machine-local preferences (typically by setting `disabled`), and
+    /// ephemeral overlays ride on top. Every layer is a full array of entry
+    /// rows; there is no field-level merge, so a patch layer that wants an
+    /// entry disabled repeats the whole row with `"disabled": true`.
+    pub fn compose(layers: impl IntoIterator<Item = Value>) -> anyhow::Result<Self> {
+        let mut merged: BTreeMap<String, EntrySpec> = BTreeMap::new();
+
+        for layer in layers {
+            let Value::Array(layer_rows) = layer else {
+                bail!("an entry layer must be an array of entry rows");
+            };
+
+            for row in layer_rows {
+                let spec = parse_row(row)?;
+
+                // Later layers override earlier ones by id.
+                merged.insert(spec.id.clone(), spec);
+            }
+        }
+
+        let tree = Self { entries: merged };
+
+        tree.validate_structure()?;
+
+        Ok(tree)
+    }
+
+    /// Serializes the tree back to its document form — the write-back
+    /// material for hosts that persist loader state. Rows come out in id
+    /// order; omitted fields stay omitted.
+    pub fn to_json_str(&self) -> anyhow::Result<String> {
+        serde_json::to_string_pretty(&self.entries.values().collect::<Vec<_>>())
+            .context("entry tree is not serializable")
+    }
+
     /// The entries in id order.
     pub fn entries(&self) -> impl Iterator<Item = &EntrySpec> {
         self.entries.values()
+    }
+
+    /// Whether the entry is mounted under this tree: it exists, is an
+    /// entry (not a group), and neither it nor any ancestor is disabled.
+    pub fn effectively_enabled(&self, id: &str) -> bool {
+        let Some(spec) = self.entries.get(id) else {
+            return false;
+        };
+
+        !self.disabled_up_the_chain(spec)
+    }
+
+    fn disabled_up_the_chain(&self, spec: &EntrySpec) -> bool {
+        let mut current = Some(spec);
+
+        while let Some(row) = current {
+            if !row.enabled() {
+                return true;
+            }
+
+            current = row
+                .parent
+                .as_deref()
+                .and_then(|parent| self.entries.get(parent));
+        }
+
+        false
+    }
+
+    /// Parents must exist, be groups, and form no cycles.
+    fn validate_structure(&self) -> anyhow::Result<()> {
+        for spec in self.entries.values() {
+            let Some(parent) = &spec.parent else {
+                continue;
+            };
+
+            let parent_row = self.entries.get(parent).with_context(|| {
+                format!(
+                    "entry \"{}\" references unknown parent \"{}\"",
+                    spec.id, parent
+                )
+            })?;
+
+            if !parent_row.is_group() {
+                bail!(
+                    "entry \"{}\" declares \"{}\" as parent, but only groups can parent",
+                    spec.id,
+                    parent
+                );
+            }
+
+            let mut seen = 0_usize;
+            let mut cursor = Some(spec);
+
+            while let Some(row) = cursor {
+                seen += 1;
+
+                if seen > self.entries.len() {
+                    bail!("entry \"{}\" sits on a parent cycle", spec.id);
+                }
+
+                cursor = row
+                    .parent
+                    .as_deref()
+                    .and_then(|parent| self.entries.get(parent));
+            }
+        }
+
+        Ok(())
     }
 
     fn get(&self, id: &str) -> Option<&EntrySpec> {
@@ -515,13 +652,20 @@ impl Loader {
             let target = next.get(id);
             let current = mounted.get(id);
 
+            // Mountable = an entry (not a group) enabled through its own
+            // flag and every ancestor's.
+            let target_mountable =
+                target.is_some_and(|spec| !spec.is_group() && next.effectively_enabled(id));
+
             match (current, target) {
-                (Some(mounted), Some(spec)) if !spec.disabled && &mounted.options == spec => {
+                (Some(mounted), Some(spec)) if target_mountable && &mounted.options == spec => {
                     kept += 1;
                     actions.push((id.clone(), Action::Keep));
                 }
-                // A disabled target unmounts whatever is there, mounted or not.
-                (Some(mounted), Some(spec)) if spec.disabled => {
+                // Any unmountable target unmounts what is there: the row
+                // left the tree, is disabled (own flag or an ancestor's), or
+                // turned into a group.
+                (Some(mounted), Some(_)) if !target_mountable => {
                     actions.push((id.clone(), Action::Remove(mounted.fiber.clone())));
                 }
                 (Some(mounted), Some(spec)) => {
@@ -533,7 +677,7 @@ impl Loader {
                 (Some(mounted), None) => {
                     actions.push((id.clone(), Action::Remove(mounted.fiber.clone())));
                 }
-                (None, Some(spec)) if spec.disabled => {
+                (None, Some(_)) if !target_mountable => {
                     kept += 1;
                     actions.push((id.clone(), Action::Keep));
                 }
@@ -570,7 +714,7 @@ impl Loader {
         let mut specs = Vec::new();
 
         for spec in tree.entries() {
-            if spec.disabled {
+            if spec.is_group() || !tree.effectively_enabled(&spec.id) {
                 continue;
             }
 
@@ -584,15 +728,20 @@ impl Loader {
     }
 
     fn register_entry(&self, spec: &EntrySpec) -> anyhow::Result<FiberHandle> {
+        let plugin_name = spec
+            .plugin
+            .as_deref()
+            .expect("only entries with a kind are registered");
+
         let kind = self
             .kinds
             .lock()
             .expect("kinds lock poisoned")
-            .get(&spec.plugin)
+            .get(plugin_name)
             .with_context(|| {
                 format!(
                     "entry \"{}\" uses unknown kind \"{}\"",
-                    spec.id, spec.plugin
+                    spec.id, plugin_name
                 )
             })?
             .clone();
@@ -609,9 +758,14 @@ impl Loader {
 }
 
 fn validate_spec(kinds: &EntryKinds, spec: &EntrySpec) -> anyhow::Result<()> {
+    let plugin_name = spec
+        .plugin
+        .as_deref()
+        .expect("groups never reach kind validation");
+
     let kind = kinds
-        .get(&spec.plugin)
-        .with_context(|| format!("unknown kind \"{}\"", spec.plugin))?;
+        .get(plugin_name)
+        .with_context(|| format!("unknown kind \"{plugin_name}\""))?;
 
     let config = spec
         .config
@@ -629,4 +783,20 @@ enum Action {
     Replace(EntrySpec, FiberHandle),
     /// The fiber to dispose.
     Remove(FiberHandle),
+}
+
+/// Parses and shape-checks one entry row: it must deserialize, carry a
+/// non-empty id, and groups must not carry a config.
+fn parse_row(row: Value) -> anyhow::Result<EntrySpec> {
+    let spec: EntrySpec = serde_json::from_value(row).context("invalid entry row")?;
+
+    if spec.id.is_empty() {
+        bail!("entry ids must be non-empty");
+    }
+
+    if spec.is_group() && spec.config.is_some() {
+        bail!("group \"{}\" must not carry a config", spec.id);
+    }
+
+    Ok(spec)
 }

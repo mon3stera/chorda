@@ -391,3 +391,207 @@ async fn mounting_twice_requires_reconcile() {
 
     kernel.dispose().await;
 }
+
+#[tokio::test]
+async fn disabling_a_group_cascades_to_all_descendants() {
+    let (kernel, loader) = loader_with_kinds();
+
+    loader
+        .mount(tree(
+            r#"[
+        { "id": "mcp", "plugin": null },
+        { "id": "fs", "plugin": "tagged", "parent": "mcp", "config": { "tag": "group/fs" } },
+        { "id": "git", "plugin": "tagged", "parent": "mcp", "config": { "tag": "group/git" } }
+    ]"#,
+        ))
+        .await
+        .unwrap();
+    wait_ready_all(&loader).await;
+
+    assert_eq!(count("group/fs"), 1);
+    assert_eq!(count("group/git"), 1);
+
+    // The group itself is disabled: members stay declared but unmount.
+    loader
+        .reconcile(tree(
+            r#"[
+        { "id": "mcp", "plugin": null, "disabled": true },
+        { "id": "fs", "plugin": "tagged", "parent": "mcp", "config": { "tag": "group/fs" } },
+        { "id": "git", "plugin": "tagged", "parent": "mcp", "config": { "tag": "group/git" } }
+    ]"#,
+        ))
+        .await
+        .unwrap();
+
+    assert!(loader.fiber_of("fs").is_none());
+    assert!(loader.fiber_of("git").is_none());
+    assert_eq!(count("group/fs"), 1, "cascade disposal, not re-apply");
+    assert_eq!(loader.mounted_ids(), Vec::<String>::new());
+
+    // Re-enable the group: members remount against the same config.
+    loader
+        .reconcile(tree(
+            r#"[
+        { "id": "mcp", "plugin": null },
+        { "id": "fs", "plugin": "tagged", "parent": "mcp", "config": { "tag": "group/fs" } },
+        { "id": "git", "plugin": "tagged", "parent": "mcp", "config": { "tag": "group/git" } }
+    ]"#,
+        ))
+        .await
+        .unwrap();
+    wait_ready_all(&loader).await;
+
+    assert_eq!(count("group/fs"), 2, "re-enabling rebuilds the instances");
+
+    kernel.dispose().await;
+}
+
+#[tokio::test]
+async fn disabling_a_nested_group_cascades_through_the_chain() {
+    let (kernel, loader) = loader_with_kinds();
+
+    loader
+        .mount(tree(
+            r#"[
+        { "id": "servers", "plugin": null },
+        { "id": "fs", "plugin": "tagged", "parent": "servers", "config": { "tag": "nest/fs" } }
+    ]"#,
+        ))
+        .await
+        .unwrap();
+    wait_ready_all(&loader).await;
+    assert_eq!(count("nest/fs"), 1);
+
+    // A grandparent flag reaches every descendant.
+    loader
+        .reconcile(tree(
+            r#"[
+        { "id": "servers", "plugin": null, "disabled": true },
+        { "id": "fs", "plugin": "tagged", "parent": "servers", "config": { "tag": "nest/fs" } }
+    ]"#,
+        ))
+        .await
+        .unwrap();
+
+    assert!(loader.fiber_of("fs").is_none());
+
+    kernel.dispose().await;
+}
+
+#[tokio::test]
+async fn a_member_of_a_removed_group_is_a_config_error() {
+    let (kernel, loader) = loader_with_kinds();
+
+    loader
+        .mount(tree(
+            r#"[
+        { "id": "mcp", "plugin": null },
+        { "id": "fs", "plugin": "tagged", "parent": "mcp", "config": { "tag": "dangle/fs" } }
+    ]"#,
+        ))
+        .await
+        .unwrap();
+    wait_ready_all(&loader).await;
+
+    // The group row vanished but the member still references it: the
+    // document itself is rejected at parse time — fail loud before any
+    // reconcile could run.
+    let orphaned = r#"[{ "id": "fs", "plugin": "tagged", "parent": "mcp", "config": { "tag": "dangle/fs" } }]"#;
+    assert!(EntryTree::from_json_str(orphaned).is_err());
+    assert!(
+        loader.fiber_of("fs").is_some(),
+        "the mounted set was never touched"
+    );
+
+    kernel.dispose().await;
+}
+
+#[tokio::test]
+async fn structural_mistakes_are_rejected() {
+    // Parent must exist.
+    assert!(
+        EntryTree::from_json_str(
+            r#"[{ "id": "fs", "plugin": "tagged", "parent": "ghost", "config": { "tag": "x" } }]"#
+        )
+        .is_err()
+    );
+
+    // Parent must be a group, not an entry with a kind.
+    assert!(
+        EntryTree::from_json_str(
+            r#"[
+        { "id": "p", "plugin": "tagged", "config": { "tag": "p" } },
+        { "id": "fs", "plugin": "tagged", "parent": "p", "config": { "tag": "x" } }
+    ]"#,
+        )
+        .is_err()
+    );
+
+    // Parent cycles are rejected.
+    assert!(
+        EntryTree::from_json_str(
+            r#"[
+        { "id": "a", "plugin": null, "parent": "b" },
+        { "id": "b", "plugin": null, "parent": "a" }
+    ]"#,
+        )
+        .is_err()
+    );
+
+    // Groups carry no config.
+    assert!(EntryTree::from_json_str(r#"[{ "id": "g", "plugin": null, "config": {} }]"#).is_err());
+}
+
+#[tokio::test]
+async fn compose_stacks_patch_layers_over_a_base() {
+    let base = serde_json::json!([
+        { "id": "memory", "plugin": "tagged", "config": { "tag": "compose/memory" } },
+        { "id": "mcp:fs", "plugin": "tagged", "config": { "tag": "compose/fs" } },
+        { "id": "mcp:git", "plugin": "tagged", "config": { "tag": "compose/git" } }
+    ]);
+
+    // The user layer disables one server and adds another; whole rows
+    // override, no field-level merge — the DSH telemetry-patch shape.
+    let user = serde_json::json!([
+        { "id": "mcp:git", "plugin": "tagged", "config": { "tag": "compose/git" }, "disabled": true },
+        { "id": "extra", "plugin": "tagged", "config": { "tag": "compose/extra" } }
+    ]);
+
+    let kernel = Kernel::new();
+    let loader = Loader::new(&kernel);
+    loader
+        .register_entry_kind(entry_kind::<Tagged>("tagged"))
+        .unwrap();
+
+    loader
+        .mount(EntryTree::compose([base, user]).unwrap())
+        .await
+        .unwrap();
+    wait_ready_all(&loader).await;
+
+    assert_eq!(count("compose/memory"), 1);
+    assert_eq!(count("compose/fs"), 1);
+    assert_eq!(count("compose/git"), 0, "the patch disabled the row");
+    assert_eq!(count("compose/extra"), 1, "the patch added the row");
+
+    kernel.dispose().await;
+}
+
+#[tokio::test]
+async fn to_json_round_trips_the_tree() {
+    let source = tree(
+        r#"[
+        { "id": "mcp", "plugin": null },
+        { "id": "fs", "plugin": "tagged", "parent": "mcp", "config": { "tag": "rt/fs" } },
+        { "id": "off", "plugin": "tagged", "config": { "tag": "rt/off" }, "disabled": true }
+    ]"#,
+    );
+
+    let json = source.to_json_str().unwrap();
+    let reparsed = EntryTree::from_json_str(&json).unwrap();
+
+    let original: Vec<_> = source.entries().cloned().collect();
+    let restored: Vec<_> = reparsed.entries().cloned().collect();
+
+    assert_eq!(original, restored);
+}
