@@ -6,6 +6,12 @@ resolver = "2"
 name = "chorda"
 version = "0.1.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "A Cordis-inspired, async-native plugin kernel: fibers, realms, scoped events, typed pipelines, and a config-driven entry loader."
+repository = "https://github.com/mon3stera/chorda"
+readme = "README.md"
+keywords = ["plugin", "async", "kernel", "fiber", "middleware"]
+categories = ["asynchronous", "rust-patterns"]
 
 [dependencies]
 anyhow = "1.0.104"
