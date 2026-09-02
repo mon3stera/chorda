@@ -12,7 +12,7 @@ use futures::future::FutureExt;
 use crate::context::Ctx;
 use crate::context::RealmId;
 use crate::fiber::{FiberHandle, FiberId, FiberShared, State, dispose_fiber, panic_message};
-use crate::plugin::Plugin;
+use crate::plugin::{Dependency, Plugin};
 use crate::service::ServiceKey;
 
 pub(crate) struct RealmNode {
@@ -243,6 +243,7 @@ impl KernelInner {
             tasks: Arc::new(crate::fiber::TaskSet::new()),
             disposables: Mutex::new(Vec::new()),
             injected: Mutex::new(Vec::new()),
+            declared_provides: Mutex::new(Vec::new()),
             provides: Mutex::new(Vec::new()),
         });
         kernel
@@ -304,6 +305,7 @@ impl KernelInner {
             tasks: Arc::new(crate::fiber::TaskSet::new()),
             disposables: Mutex::new(Vec::new()),
             injected: Mutex::new(Vec::new()),
+            declared_provides: Mutex::new(Vec::new()),
             provides: Mutex::new(Vec::new()),
         });
 
@@ -444,32 +446,163 @@ impl KernelInner {
     }
 
     /// Removes and returns every pending entry whose declared dependencies
-    /// now resolve through the entry's own realm chain.
+    /// are now satisfied through the entry's own realm chain: hard
+    /// dependencies must resolve; soft dependencies must have no unsettled
+    /// declared provider left.
     pub(crate) fn take_satisfied(&self) -> Vec<(Arc<FiberShared>, Arc<dyn Plugin>)> {
+        // Drain first: the satisfaction check consults the pending queue
+        // itself (soft dependencies look for declared providers), so the
+        // lock must not be held across the evaluation.
+        let entries: Vec<PendingEntry> = self
+            .pending
+            .lock()
+            .expect("pending lock poisoned")
+            .drain(..)
+            .collect();
+
+        // The drained entries are each other's declared providers: keep
+        // their declarations visible while the queue is empty.
+        let peers: Vec<(FiberId, RealmId, Vec<ServiceKey>)> = entries
+            .iter()
+            .map(|entry| (entry.shared.id, entry.shared.realm, entry.plugin.provides()))
+            .collect();
+
         let mut ready = Vec::new();
+        let mut rest = Vec::new();
+
+        for PendingEntry { shared, plugin } in entries {
+            if shared.disposal_started.load(Ordering::SeqCst) {
+                continue;
+            }
+
+            if self.dependencies_satisfied(shared.id, shared.realm, &*plugin, &peers) {
+                ready.push((shared, plugin));
+            } else {
+                rest.push(PendingEntry { shared, plugin });
+            }
+        }
 
         self.pending
             .lock()
             .expect("pending lock poisoned")
-            .retain(|entry| {
-                if entry.shared.disposal_started.load(Ordering::SeqCst) {
-                    return false;
-                }
-
-                let satisfied = entry
-                    .plugin
-                    .inject()
-                    .iter()
-                    .all(|key| self.lookup(entry.shared.realm, key).is_some());
-
-                if satisfied {
-                    ready.push((entry.shared.clone(), entry.plugin.clone()));
-                }
-
-                satisfied
-            });
+            .extend(rest);
 
         ready
+    }
+
+    /// Starts every pending entry whose dependencies just became satisfied.
+    pub(crate) fn wake_satisfied(self: &Arc<Self>) {
+        for (shared, plugin) in self.take_satisfied() {
+            self.start_fiber(shared, plugin);
+        }
+    }
+
+    /// Whether a plugin's declared dependencies are satisfied from `realm`:
+    /// every hard dependency resolves, and every soft dependency has no
+    /// unsettled declared provider. A soft dependency whose service is
+    /// already present, or whose declared providers have all settled without
+    /// providing, is satisfied — the dependent starts and reads `None`.
+    pub(crate) fn dependencies_satisfied(
+        &self,
+        waiting: FiberId,
+        realm: RealmId,
+        plugin: &dyn Plugin,
+        peers: &[(FiberId, RealmId, Vec<ServiceKey>)],
+    ) -> bool {
+        for dependency in plugin.inject() {
+            match dependency {
+                Dependency::Hard(key) => {
+                    if self.lookup(realm, &key).is_none() {
+                        return false;
+                    }
+                }
+                Dependency::Soft(key) => {
+                    if self.lookup(realm, &key).is_some() {
+                        continue;
+                    }
+
+                    if self.has_declared_provider(waiting, realm, &key, peers) {
+                        return false;
+                    }
+                }
+            }
+        }
+
+        true
+    }
+
+    /// Whether a live plugin — still pending, or starting — has declared
+    /// that it provides `key` from a realm whose services `realm` can see.
+    /// Settled providers (ready or gone) do not count: their soft dependents
+    /// give up and start with whatever the table holds.
+    pub(crate) fn has_declared_provider(
+        &self,
+        waiting: FiberId,
+        realm: RealmId,
+        key: &ServiceKey,
+        peers: &[(FiberId, RealmId, Vec<ServiceKey>)],
+    ) -> bool {
+        if peers.iter().any(|(id, peer_realm, declared)| {
+            *id != waiting
+                && declared.iter().any(|provided| provided == key)
+                && self.visible_from(*peer_realm, realm)
+        }) {
+            return true;
+        }
+
+        let pending_declares = self
+            .pending
+            .lock()
+            .expect("pending lock poisoned")
+            .iter()
+            .any(|entry| {
+                entry.shared.id != waiting
+                    && !entry.shared.disposal_started.load(Ordering::SeqCst)
+                    && entry
+                        .plugin
+                        .provides()
+                        .iter()
+                        .any(|declared| declared == key)
+                    && self.visible_from(entry.shared.realm, realm)
+            });
+
+        if pending_declares {
+            return true;
+        }
+
+        self.fibers
+            .lock()
+            .expect("fibers lock poisoned")
+            .iter()
+            .any(|(id, fiber)| {
+                *id != waiting
+                    && !fiber.disposal_started.load(Ordering::SeqCst)
+                    && matches!(*fiber.state.borrow(), State::Starting)
+                    && fiber
+                        .declared_provides
+                        .lock()
+                        .expect("declared lock poisoned")
+                        .iter()
+                        .any(|declared| declared == key)
+                    && self.visible_from(fiber.realm, realm)
+            })
+    }
+
+    /// Whether services in `from` resolve through a lookup from `to` — that
+    /// is, `from` is `to` itself or one of its ancestors.
+    pub(crate) fn visible_from(&self, from: RealmId, to: RealmId) -> bool {
+        let realms = self.realms.lock().expect("realms lock poisoned");
+        let mut next = Some(to);
+
+        while let Some(current) = next {
+            if current == from {
+                return true;
+            }
+
+            next = realms.get(&current).and_then(|node| node.parent);
+        }
+
+        false
     }
 
     pub(crate) fn take_all_pending(&self) -> Vec<(Arc<FiberShared>, Arc<dyn Plugin>)> {
@@ -644,7 +777,10 @@ impl KernelInner {
                 .plugin
                 .inject()
                 .iter()
-                .map(|key| key.to_string())
+                .map(|dependency| match dependency {
+                    Dependency::Hard(key) => key.to_string(),
+                    Dependency::Soft(key) => format!("soft {key}"),
+                })
                 .collect();
 
             let _ = writeln!(
@@ -912,7 +1048,27 @@ impl KernelInner {
             return;
         }
 
-        *shared.injected.lock().expect("injected lock poisoned") = plugin.inject();
+        let (hard_keys, declared) = {
+            let mut hard_keys = Vec::new();
+            let mut declared = Vec::new();
+
+            for dependency in plugin.inject() {
+                match dependency {
+                    Dependency::Hard(key) => hard_keys.push(key),
+                    Dependency::Soft(_) => {}
+                }
+            }
+
+            declared.extend(plugin.provides());
+
+            (hard_keys, declared)
+        };
+
+        *shared.injected.lock().expect("injected lock poisoned") = hard_keys;
+        *shared
+            .declared_provides
+            .lock()
+            .expect("declared lock poisoned") = declared;
         shared.state.send_replace(State::Starting);
         self.activity.notify_waiters();
 
@@ -940,6 +1096,10 @@ impl KernelInner {
                         task_shared.state.send_replace(State::Ready);
                     }
 
+                    // The fiber settled: soft dependents waiting on its
+                    // declared provides may now start with what the table
+                    // holds.
+                    kernel.wake_satisfied();
                     kernel.activity.notify_waiters();
                 }
                 Ok(Err(error)) => {

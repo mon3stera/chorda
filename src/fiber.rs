@@ -251,8 +251,14 @@ pub(crate) struct FiberShared {
     pub failure: Mutex<Option<String>>,
     /// Cleanup futures, executed last-in-first-out on disposal.
     pub disposables: Mutex<Vec<Disposable>>,
-    /// Dependency keys that were satisfied when the fiber started.
+    /// Dependency keys that were satisfied when the fiber started. Hard
+    /// dependencies only: soft dependencies are not lifecycle-coupled and
+    /// never disconnect.
     pub injected: Mutex<Vec<ServiceKey>>,
+
+    /// Services this fiber's plugin declared it will provide; the promise
+    /// soft dependents wait on. Recorded at start, never mutated after.
+    pub declared_provides: Mutex<Vec<ServiceKey>>,
     pub provides: Mutex<Vec<ProvidedService>>,
 }
 

@@ -7,7 +7,9 @@ use std::{
 
 use serde::Deserialize;
 
-use chorda::{ConfiguredPlugin, Ctx, EntryTree, Kernel, Loader, Plugin, ServiceKey, entry_kind};
+use chorda::{
+    ConfiguredPlugin, Ctx, Dependency, EntryTree, Kernel, Loader, Plugin, ServiceKey, entry_kind,
+};
 
 /// How many times each tag's apply ran. Global because the loader builds
 /// instances itself; tags are unique per test so parallel tests stay apart.
@@ -79,8 +81,8 @@ impl Plugin for Dependent {
         "dependent"
     }
 
-    fn inject(&self) -> Vec<ServiceKey> {
-        vec![ServiceKey::of::<TaggedService>()]
+    fn inject(&self) -> Vec<Dependency> {
+        vec![ServiceKey::of::<TaggedService>().into()]
     }
 
     async fn apply(&self, ctx: Ctx) -> chorda::anyhow::Result<()> {

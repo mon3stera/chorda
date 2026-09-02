@@ -502,11 +502,26 @@ impl Loader {
 
         let specs = self.validate_against_kinds(&tree)?;
 
+        // One batch per pass: every entry is queued before any starts, so a
+        // soft dependency sees the whole pass's provides declarations
+        // regardless of registration order.
+        let plugins: Vec<(EntrySpec, Arc<dyn Plugin>)> = specs
+            .into_iter()
+            .map(|spec| {
+                let plugin = self.build_entry(&spec)?;
+
+                Ok((spec, plugin))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        let handles = self
+            .kernel
+            .root_ctx()
+            .register_batch(plugins.iter().map(|(_, plugin)| plugin.clone()).collect());
+
         let mut mounted_ids = Vec::new();
 
-        for spec in specs {
-            let fiber = self.register_entry(&spec)?;
-
+        for ((spec, _), fiber) in plugins.iter().zip(handles) {
             self.mounted.lock().expect("mounted lock poisoned").insert(
                 spec.id.clone(),
                 Mounted {
@@ -515,7 +530,7 @@ impl Loader {
                 },
             );
 
-            mounted_ids.push(spec.id);
+            mounted_ids.push(spec.id.clone());
         }
 
         Ok(mounted_ids)
@@ -544,35 +559,21 @@ impl Loader {
         report.kept = kept;
         self.validate_actions(&actions)?;
 
+        // Phase one: dispose everything the pass removes or replaces, so
+        // revocation completes before any replacement registers.
+        //
+        // Phase two: register the creations as one batch, so the pass's
+        // provides declarations are all visible before any of its entries
+        // starts and soft dependencies are order-independent.
+        let mut creations: Vec<(String, EntrySpec, bool)> = Vec::new();
+
         for (id, action) in &actions {
             match action {
-                Action::Create(spec) => {
-                    let fiber = self.register_entry(spec)?;
-
-                    self.mounted.lock().expect("mounted lock poisoned").insert(
-                        id.clone(),
-                        Mounted {
-                            options: spec.clone(),
-                            fiber,
-                        },
-                    );
-
-                    report.created.push(id.clone());
-                }
+                Action::Create(spec) => creations.push((id.clone(), spec.clone(), false)),
                 Action::Replace(spec, fiber) => {
                     fiber.dispose().await;
 
-                    let new_fiber = self.register_entry(spec)?;
-
-                    self.mounted.lock().expect("mounted lock poisoned").insert(
-                        id.clone(),
-                        Mounted {
-                            options: spec.clone(),
-                            fiber: new_fiber,
-                        },
-                    );
-
-                    report.updated.push(id.clone());
+                    creations.push((id.clone(), spec.clone(), true));
                 }
                 Action::Remove(fiber) => {
                     fiber.dispose().await;
@@ -585,6 +586,29 @@ impl Loader {
                     report.removed.push(id.clone());
                 }
                 Action::Keep => {}
+            }
+        }
+
+        let plugins = creations
+            .iter()
+            .map(|(_, spec, _)| self.build_entry(spec))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        let handles = self.kernel.root_ctx().register_batch(plugins);
+
+        for ((id, spec, replaced), fiber) in creations.into_iter().zip(handles) {
+            self.mounted.lock().expect("mounted lock poisoned").insert(
+                id.clone(),
+                Mounted {
+                    options: spec,
+                    fiber,
+                },
+            );
+
+            if replaced {
+                report.updated.push(id);
+            } else {
+                report.created.push(id);
             }
         }
 
@@ -614,9 +638,14 @@ impl Loader {
                 return Ok(());
             }
 
-            for (id, spec) in dead {
-                let fiber = self.register_entry(&spec)?;
+            let plugins = dead
+                .iter()
+                .map(|(_, spec)| self.build_entry(spec))
+                .collect::<anyhow::Result<Vec<_>>>()?;
 
+            let handles = self.kernel.root_ctx().register_batch(plugins);
+
+            for ((id, spec), fiber) in dead.into_iter().zip(handles) {
                 self.mounted.lock().expect("mounted lock poisoned").insert(
                     id.clone(),
                     Mounted {
@@ -727,7 +756,7 @@ impl Loader {
         Ok(specs)
     }
 
-    fn register_entry(&self, spec: &EntrySpec) -> anyhow::Result<FiberHandle> {
+    fn build_entry(&self, spec: &EntrySpec) -> anyhow::Result<Arc<dyn Plugin>> {
         let plugin_name = spec
             .plugin
             .as_deref()
@@ -753,7 +782,7 @@ impl Loader {
         let plugin = (kind.build)(&config)
             .with_context(|| format!("entry \"{}\" failed to build", spec.id))?;
 
-        Ok(self.kernel.root_ctx().register_shared(plugin))
+        Ok(plugin)
     }
 }
 

@@ -6,7 +6,7 @@ use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use chorda::{Ctx, EventNext, FiberId, Kernel, Plugin, ServiceKey, State, fn_plugin};
+use chorda::{Ctx, Dependency, EventNext, FiberId, Kernel, Plugin, ServiceKey, State, fn_plugin};
 
 type Shared<T> = Arc<StdMutex<T>>;
 
@@ -55,7 +55,7 @@ async fn pending_plugins_start_once_dependencies_are_provided() {
                 Ok(())
             }
         })
-        .inject(vec![ServiceKey::of::<u32>()])
+        .inject(vec![ServiceKey::of::<u32>().into()])
     };
 
     let fiber = root.register(plugin);
@@ -81,7 +81,7 @@ async fn pending_plugins_can_be_disposed_without_starting() {
     let root = kernel.root_ctx();
 
     let plugin = fn_plugin("never-starts", |_ctx: Ctx| async { Ok(()) })
-        .inject(vec![ServiceKey::of::<u32>()]);
+        .inject(vec![ServiceKey::of::<u32>().into()]);
 
     let fiber = root.register(plugin);
     assert_eq!(fiber.state(), State::Pending);
@@ -160,7 +160,7 @@ async fn disposing_a_provider_disconnects_dependents_and_removes_services() {
 
         Ok(())
     })
-    .inject(vec![ServiceKey::of::<u32>()]);
+    .inject(vec![ServiceKey::of::<u32>().into()]);
 
     let bystander = fn_plugin("bystander", |_ctx: Ctx| async { Ok(()) });
 
@@ -462,7 +462,7 @@ async fn replacing_a_service_disconnects_its_dependents() {
 
         Ok(())
     })
-    .inject(vec![ServiceKey::of::<u32>()]);
+    .inject(vec![ServiceKey::of::<u32>().into()]);
 
     let fiber = root.register(dependent);
     root.provide(Arc::new(1u32)).await;
@@ -579,8 +579,8 @@ impl Plugin for CounterPlugin {
         "counter"
     }
 
-    fn inject(&self) -> Vec<ServiceKey> {
-        vec![ServiceKey::of::<u32>()]
+    fn inject(&self) -> Vec<Dependency> {
+        vec![ServiceKey::of::<u32>().into()]
     }
 
     async fn apply(&self, ctx: Ctx) -> anyhow::Result<()> {
@@ -626,7 +626,7 @@ async fn nested_plugins_form_a_tree_and_cascade_together() {
 
                 Ok(())
             })
-            .inject(vec![ServiceKey::of::<u32>()]),
+            .inject(vec![ServiceKey::of::<u32>().into()]),
         );
 
         Ok(())
@@ -1215,8 +1215,8 @@ async fn describe_renders_the_tree_services_and_families() {
     let fiber = root.register(tool);
     fiber.wait_ready().await.unwrap();
 
-    let waiting =
-        fn_plugin("waiting", |_ctx: Ctx| async { Ok(()) }).inject(vec![ServiceKey::of::<String>()]);
+    let waiting = fn_plugin("waiting", |_ctx: Ctx| async { Ok(()) })
+        .inject(vec![ServiceKey::of::<String>().into()]);
     root.register(waiting);
 
     let report = kernel.describe();
@@ -1351,4 +1351,153 @@ fn the_events_macro_registers_a_catalog() {
     assert!((registration.output)().contains("bool"));
     assert!((registration.payload)().contains("String"));
     assert!((registration.marker)().contains("MacroGate"));
+}
+
+#[tokio::test]
+async fn soft_dependencies_wait_for_declared_providers() {
+    let kernel = Kernel::new();
+    let root = kernel.root_ctx();
+
+    let saw_sink = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // The consumer registers FIRST, before its soft provider even exists.
+    let consumer = {
+        let saw_sink = saw_sink.clone();
+
+        fn_plugin("consumer", move |ctx: Ctx| {
+            let saw_sink = saw_sink.clone();
+
+            async move {
+                let sink = ctx.get::<String>();
+
+                saw_sink.store(sink.is_some(), Ordering::SeqCst);
+
+                Ok(())
+            }
+        })
+        .inject(vec![Dependency::soft(ServiceKey::of::<String>())])
+    };
+
+    // The consumer registers BEFORE the provider exists; a batch queues
+    // both before either starts, so the soft dependency sees the whole
+    // batch's provides declarations regardless of registration order.
+    let provider = fn_plugin("provider", |ctx: Ctx| async move {
+        ctx.provide(Arc::new("telemetry".to_owned())).await;
+
+        Ok(())
+    })
+    .provides(vec![ServiceKey::of::<String>()]);
+
+    let handles = root.register_batch(vec![
+        Arc::new(consumer) as Arc<dyn Plugin>,
+        Arc::new(provider) as Arc<dyn Plugin>,
+    ]);
+
+    let consumer_fiber = handles[0].clone();
+    let provider_fiber = handles[1].clone();
+
+    assert_eq!(
+        consumer_fiber.state(),
+        State::Pending,
+        "the batch's declared provider is still settling, so the soft dependent waits"
+    );
+
+    provider_fiber.wait_ready().await.expect("provider ready");
+    consumer_fiber.wait_ready().await.expect("consumer ready");
+
+    assert!(
+        saw_sink.load(Ordering::SeqCst),
+        "the consumer started after the provider settled and read Some"
+    );
+
+    kernel.dispose().await;
+}
+
+#[tokio::test]
+async fn soft_dependencies_start_when_nothing_declares_the_service() {
+    let kernel = Kernel::new();
+    let root = kernel.root_ctx();
+
+    let plugin = fn_plugin("loose", |ctx: Ctx| async move {
+        assert!(
+            ctx.get::<u8>().is_none(),
+            "no provider exists, the soft read is None"
+        );
+
+        Ok(())
+    })
+    .inject(vec![Dependency::soft(ServiceKey::of::<u8>())]);
+
+    let fiber = root.register(plugin);
+
+    fiber
+        .wait_ready()
+        .await
+        .expect("no declared provider: the soft dependent starts immediately");
+
+    kernel.dispose().await;
+}
+
+#[tokio::test]
+async fn soft_dependencies_give_up_when_a_declared_provider_fails() {
+    let kernel = Kernel::new();
+    let root = kernel.root_ctx();
+
+    let consumer = fn_plugin("consumer", |ctx: Ctx| async move {
+        assert!(
+            ctx.get::<u64>().is_none(),
+            "the provider settled without providing"
+        );
+
+        Ok(())
+    })
+    .inject(vec![Dependency::soft(ServiceKey::of::<u64>())]);
+
+    let consumer_fiber = root.register(consumer);
+
+    let provider = fn_plugin("failing-provider", |_ctx: Ctx| async move {
+        anyhow::bail!("never provides");
+    })
+    .provides(vec![ServiceKey::of::<u64>()]);
+
+    let provider_fiber = root.register(provider);
+
+    assert!(
+        provider_fiber.wait_ready().await.is_err(),
+        "the provider failed"
+    );
+
+    consumer_fiber
+        .wait_ready()
+        .await
+        .expect("the settled provider releases the soft dependent");
+
+    kernel.dispose().await;
+}
+
+#[tokio::test]
+async fn soft_dependencies_are_never_disconnected_on_replacement() {
+    let kernel = Kernel::new();
+    let root = kernel.root_ctx();
+
+    root.provide(Arc::new(1u16)).await;
+
+    let plugin = fn_plugin("observer", |_ctx: Ctx| async move { Ok(()) })
+        .inject(vec![Dependency::soft(ServiceKey::of::<u16>())]);
+
+    let fiber = root.register(plugin);
+    fiber.wait_ready().await.expect("started");
+
+    // Replacing the service disposes hard dependents; soft ones stay.
+    root.provide(Arc::new(2u16)).await;
+
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+    assert_eq!(
+        fiber.state(),
+        State::Ready,
+        "soft dependencies carry no lifecycle coupling"
+    );
+
+    kernel.dispose().await;
 }

@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "tests/crates/plugin-alpha", "tests/crates/plugin-beta"]
+members = [".", "chorda-macros", "tests/crates/plugin-alpha", "tests/crates/plugin-beta"]
 resolver = "2"
 
 [package]
@@ -16,6 +16,7 @@ categories = ["asynchronous", "rust-patterns"]
 [dependencies]
 anyhow = "1.0.104"
 async-trait = "0.1.92"
+chorda-macros = { path = "chorda-macros", version = "0.1.0" }
 futures = "0.3.34"
 inventory = "0.3.21"
 schemars = "1.2.2"

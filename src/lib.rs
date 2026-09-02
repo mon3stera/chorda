@@ -38,7 +38,7 @@
 //!
 //!     Ok(())
 //! })
-//! .inject(vec![ServiceKey::of::<Counter>()]);
+//! .inject(vec![ServiceKey::of::<Counter>().into()]);
 //!
 //! let fiber = root.register(greeter);
 //! assert_eq!(fiber.state(), State::Pending);
@@ -54,6 +54,7 @@
 
 mod context;
 mod events;
+mod extract;
 mod fiber;
 mod kernel;
 mod loader;
@@ -64,8 +65,10 @@ mod service;
 
 pub use anyhow;
 pub use async_trait::async_trait;
+pub use chorda_macros::plugin;
 pub use context::{Ctx, RealmId};
 pub use events::{Event, EventAggregate, EventNext, Events, HandlerId};
+pub use extract::FromService;
 pub use fiber::{FiberHandle, FiberId, State};
 pub use inventory;
 pub use kernel::Kernel;
@@ -73,7 +76,7 @@ pub use loader::{
     ConfiguredPlugin, EntryKind, EntryKinds, EntrySpec, EntryTree, Loader, LoaderReport, entry_kind,
 };
 pub use pipeline::{Next, Pipeline, PipelineId};
-pub use plugin::{FnPlugin, Plugin, fn_plugin};
+pub use plugin::{Dependency, FnPlugin, Plugin, fn_plugin};
 pub use registry::{
     EventRegistration, PipelineRegistration, PluginRegistration, discover_event_names,
     discover_pipeline_names, discover_plugin_names, event_registrations, pipeline_registrations,

@@ -132,9 +132,7 @@ impl Ctx {
             }
         }
 
-        for (shared, plugin) in self.kernel.take_satisfied() {
-            self.kernel.start_fiber(shared, plugin);
-        }
+        self.kernel.wake_satisfied();
     }
 
     /// Registers a plugin on a new child fiber of the current fiber and
@@ -162,18 +160,54 @@ impl Ctx {
             return handle;
         }
 
-        let satisfied = plugin
-            .inject()
-            .iter()
-            .all(|key| self.kernel.lookup(self.realm, key).is_some());
-
-        if satisfied {
+        if self
+            .kernel
+            .dependencies_satisfied(shared.id, self.realm, &*plugin, &[])
+        {
             self.kernel.start_fiber(shared, plugin);
         } else {
             self.kernel.add_pending(shared, plugin);
         }
 
         handle
+    }
+
+    /// Registers several plugins as one batch: every fiber is created and
+    /// enqueued first, and only then are the satisfiable ones started.
+    ///
+    /// The two-phase order matters for soft dependencies. A plugin's
+    /// `provides` declaration is visible to the batch's soft dependents as
+    /// soon as the whole batch is queued, so a soft dependent waits for its
+    /// provider no matter whether the provider's entry happens to be
+    /// registered before or after it. With [`Ctx::register_shared`], each
+    /// plugin is judged the moment it registers, and a provider registered
+    /// later is invisible to an already-started dependent.
+    pub fn register_batch(&self, plugins: Vec<Arc<dyn Plugin>>) -> Vec<FiberHandle> {
+        let mut queued = Vec::new();
+
+        for plugin in plugins {
+            let shared = self
+                .kernel
+                .create_fiber(self.fiber, self.realm, plugin.name().to_owned());
+            let handle = FiberHandle {
+                kernel: self.kernel.clone(),
+                shared: shared.clone(),
+            };
+
+            if !self.kernel.is_active(self.fiber) {
+                shared.disposal_started.store(true, Ordering::SeqCst);
+                shared.state.send_replace(State::Disposed);
+                self.kernel.remove_fiber(shared.id);
+            } else {
+                self.kernel.add_pending(shared, plugin);
+            }
+
+            queued.push(handle);
+        }
+
+        self.kernel.wake_satisfied();
+
+        queued
     }
 
     /// Forks a bare child fiber usable as a cleanup scope. The scope is born

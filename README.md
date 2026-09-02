@@ -68,6 +68,15 @@ async fn main() -> chorda::anyhow::Result<()> {
 - **Reactive start.** A plugin whose injections are missing stays
   `Pending` and starts the moment they are provided — no manual wiring of
   startup order.
+- **Hard and soft dependencies.** `inject()` returns `Dependency` values:
+  `Dependency::Hard(key)` is the graph edge — the plugin waits for the
+  service and is disconnected when its provider is replaced or disposed;
+  `Dependency::Soft(key)` waits only for providers that declared the
+  service through `Plugin::provides()`, then starts with whatever the
+  table holds (`None` when nobody provided) and is never disconnected.
+  Within a `Ctx::register_batch` pass, every plugin's declaration is
+  visible to every other before any of them starts, so soft dependencies
+  are order-independent.
 - **A tree, not a list.** Plugins registered inside another plugin's `apply`
   become its child fibers; disposing a parent cascades to every child.
 - **LIFO effects.** [`Ctx::effect`] registers async cleanup; on disposal
@@ -194,6 +203,28 @@ The built-in behavior sits at the end of the chain; a middleware that never
 calls `next` vetoes it. `middleware_before` prepends a layer instead of
 appending.
 
+## Extractors: the `#[plugin]` macro
+
+Writing a dependency in `inject` and then fetching it again inside `apply`
+is the same knowledge twice. The `#[chorda::plugin]` attribute collapses it:
+service parameters after `ctx` are extracted from the context, `inject` is
+derived from them, and hard/soft is expressed by the parameter type
+itself — `Arc<T>` is hard, `Option<Arc<T>>` is soft:
+
+```rust,ignore
+#[chorda::plugin]
+impl Plugin for McpPlugin {
+    async fn apply(&self, ctx: Ctx, config: Arc<Config>, db: Option<Arc<Db>>) -> anyhow::Result<()> {
+        // config is present by construction: inject was derived from it.
+
+        // db is None when no Db service exists — the plugin still starts.
+    }
+}
+```
+
+A hand-written `inject` in the same block wins over the derived one. When
+`apply` runs, the hard services are guaranteed to be in the table.
+
 ## Compile-time plugin discovery
 
 Plugin crates submit themselves at compile time; a host binary picks up
@@ -268,6 +299,6 @@ nothing auto-restarts it.
 
 ## Testing
 
-`cargo test` runs 72 tests, including a two-plugin workspace
+`cargo test` runs 80 tests, including a two-plugin workspace
 (`tests/crates/plugin-alpha`, `plugin-beta`) that exercises compile-time
 discovery end to end.

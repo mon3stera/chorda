@@ -25,7 +25,7 @@ async fn replacing_a_service_leaves_sibling_realms_alone() {
 
             Ok(())
         })
-        .inject(vec![ServiceKey::of::<Db>()])
+        .inject(vec![ServiceKey::of::<Db>().into()])
     };
 
     let (fiber_a, fiber_b) = (
@@ -75,7 +75,7 @@ async fn disposing_a_provider_leaves_sibling_realms_alone() {
 
             Ok(())
         })
-        .inject(vec![ServiceKey::of::<Db>()]),
+        .inject(vec![ServiceKey::of::<Db>().into()]),
     );
     consumer_b.wait_ready().await.unwrap();
 
@@ -105,7 +105,7 @@ async fn consumers_inheriting_from_an_ancestor_realm_are_still_disconnected() {
 
             Ok(())
         })
-        .inject(vec![ServiceKey::of::<Db>()]),
+        .inject(vec![ServiceKey::of::<Db>().into()]),
     );
     consumer.wait_ready().await.unwrap();
 
