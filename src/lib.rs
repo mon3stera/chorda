@@ -1,4 +1,4 @@
-//! Nodus: a Cordis-inspired, async-native plugin kernel.
+//! Chorda: a Cordis-inspired, async-native plugin kernel.
 //!
 //! The model, in one paragraph: a [`Kernel`] owns a tree of
 //! [fibers](FiberHandle) (units of async lifecycle), a tree of
@@ -24,7 +24,7 @@
 //! ```
 //! use std::sync::Arc;
 //!
-//! use nodus::{Kernel, ServiceKey, State, fn_plugin};
+//! use chorda::{Kernel, ServiceKey, State, fn_plugin};
 //!
 //! struct Counter(u32);
 //!
@@ -32,7 +32,7 @@
 //! let kernel = Kernel::new();
 //! let root = kernel.root_ctx();
 //!
-//! let greeter = fn_plugin("greeter", |ctx: nodus::Ctx| async move {
+//! let greeter = fn_plugin("greeter", |ctx: chorda::Ctx| async move {
 //!     let counter = ctx.get::<Counter>().expect("counter injected");
 //!     assert_eq!(counter.0, 7);
 //!

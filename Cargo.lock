@@ -38,6 +38,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
+name = "chorda"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "futures",
+ "inventory",
+ "plugin-alpha",
+ "plugin-beta",
+ "schemars",
+ "serde",
+ "serde_json",
+ "slotmap",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "dyn-clone"
 version = "1.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -189,24 +207,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "nodus"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "futures",
- "inventory",
- "plugin-alpha",
- "plugin-beta",
- "schemars",
- "serde",
- "serde_json",
- "slotmap",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -245,16 +245,16 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 name = "plugin-alpha"
 version = "0.1.0"
 dependencies = [
+ "chorda",
  "inventory",
- "nodus",
 ]
 
 [[package]]
 name = "plugin-beta"
 version = "0.1.0"
 dependencies = [
+ "chorda",
  "inventory",
- "nodus",
 ]
 
 [[package]]

@@ -1,7 +1,7 @@
 //! A referenced test plugin: the host calls `anchor`, so the linker keeps
 //! this crate's object files and its registration survives.
 
-use nodus::{Ctx, Plugin};
+use chorda::{Ctx, Plugin};
 
 pub struct AlphaPlugin;
 
@@ -11,18 +11,18 @@ impl Default for AlphaPlugin {
     }
 }
 
-#[nodus::async_trait]
+#[chorda::async_trait]
 impl Plugin for AlphaPlugin {
     fn name(&self) -> &str {
         "alpha"
     }
 
-    async fn apply(&self, _ctx: Ctx) -> nodus::anyhow::Result<()> {
+    async fn apply(&self, _ctx: Ctx) -> chorda::anyhow::Result<()> {
         Ok(())
     }
 }
 
-nodus::register_plugin! {
+chorda::register_plugin! {
     name: "alpha",
     build: AlphaPlugin::default,
 }

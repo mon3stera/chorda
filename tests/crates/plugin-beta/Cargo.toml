@@ -6,4 +6,4 @@ publish = false
 
 [dependencies]
 inventory = "0.3.21"
-nodus = { path = "../../.." }
+chorda = { path = "../../.." }

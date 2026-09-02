@@ -16,7 +16,7 @@
 //! session adds is not undone by global transforms.
 //!
 //! ```rust
-//! use nodus::{Ctx, Kernel, Pipeline};
+//! use chorda::{Ctx, Kernel, Pipeline};
 //!
 //! struct ChatRequest;
 //!

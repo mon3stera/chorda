@@ -1,4 +1,4 @@
-//! Integration tests for the nodus kernel: reactive plugin start, fiber
+//! Integration tests for the chorda kernel: reactive plugin start, fiber
 //! cascade disposal, realm-scoped services, effects, and scoped events.
 
 use std::sync::Arc;
@@ -6,7 +6,7 @@ use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use nodus::{Ctx, EventNext, FiberId, Kernel, Plugin, ServiceKey, State, fn_plugin};
+use chorda::{Ctx, EventNext, FiberId, Kernel, Plugin, ServiceKey, State, fn_plugin};
 
 type Shared<T> = Arc<StdMutex<T>>;
 
@@ -1181,7 +1181,7 @@ async fn waterfall_composes_around_the_builtin_and_can_veto() {
 }
 struct Gate;
 
-impl nodus::Pipeline for Gate {
+impl chorda::Pipeline for Gate {
     type Input = u8;
 
     type Output = u8;

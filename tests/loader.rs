@@ -7,7 +7,7 @@ use std::{
 
 use serde::Deserialize;
 
-use nodus::{ConfiguredPlugin, Ctx, EntryTree, Kernel, Loader, Plugin, ServiceKey, entry_kind};
+use chorda::{ConfiguredPlugin, Ctx, EntryTree, Kernel, Loader, Plugin, ServiceKey, entry_kind};
 
 /// How many times each tag's apply ran. Global because the loader builds
 /// instances itself; tags are unique per test so parallel tests stay apart.
@@ -31,13 +31,13 @@ struct TaggedConfig {
     tag: String,
 }
 
-#[nodus::async_trait]
+#[chorda::async_trait]
 impl Plugin for Tagged {
     fn name(&self) -> &str {
         "tagged"
     }
 
-    async fn apply(&self, ctx: Ctx) -> nodus::anyhow::Result<()> {
+    async fn apply(&self, ctx: Ctx) -> chorda::anyhow::Result<()> {
         *counts()
             .lock()
             .unwrap()
@@ -73,7 +73,7 @@ struct DependentConfig {}
 #[derive(Clone)]
 struct DependentSaw(String);
 
-#[nodus::async_trait]
+#[chorda::async_trait]
 impl Plugin for Dependent {
     fn name(&self) -> &str {
         "dependent"
@@ -83,7 +83,7 @@ impl Plugin for Dependent {
         vec![ServiceKey::of::<TaggedService>()]
     }
 
-    async fn apply(&self, ctx: Ctx) -> nodus::anyhow::Result<()> {
+    async fn apply(&self, ctx: Ctx) -> chorda::anyhow::Result<()> {
         let service = ctx.get::<TaggedService>().expect("dependency injected");
 
         ctx.provide(Arc::new(DependentSaw(service.0.clone()))).await;

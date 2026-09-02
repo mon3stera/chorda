@@ -172,7 +172,7 @@ impl Kernel {
     /// Renders a human-readable snapshot of the kernel: the fiber tree with
     /// each fiber's state, injected and provided services, task counts; the
     /// pending plugins and the service keys they wait for; the event handler
-    /// families; and the pipeline chains. What a `nodus doctor` would print.
+    /// families; and the pipeline chains. What a `chorda doctor` would print.
     ///
     /// Locks every registry for the duration of the render — fine for
     /// diagnostics, not for calling on every hot-path iteration.

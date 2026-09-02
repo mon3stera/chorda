@@ -3,7 +3,7 @@ members = [".", "tests/crates/plugin-alpha", "tests/crates/plugin-beta"]
 resolver = "2"
 
 [package]
-name = "nodus"
+name = "chorda"
 version = "0.1.0"
 edition = "2024"
 

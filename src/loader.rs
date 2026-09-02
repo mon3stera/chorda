@@ -27,7 +27,7 @@
 //!
 //! use serde::Deserialize;
 //!
-//! use nodus::{ConfiguredPlugin, Ctx, Loader, Kernel, Plugin, entry_kind};
+//! use chorda::{ConfiguredPlugin, Ctx, Loader, Kernel, Plugin, entry_kind};
 //!
 //! struct Echo {
 //!     prefix: String,
@@ -38,13 +38,13 @@
 //!     prefix: String,
 //! }
 //!
-//! # #[nodus::async_trait]
+//! # #[chorda::async_trait]
 //! impl Plugin for Echo {
 //!     fn name(&self) -> &str {
 //!         "echo"
 //!     }
 //!
-//!     async fn apply(&self, ctx: Ctx) -> nodus::anyhow::Result<()> {
+//!     async fn apply(&self, ctx: Ctx) -> chorda::anyhow::Result<()> {
 //!         ctx.provide(Arc::new(self.prefix.clone())).await;
 //!
 //!         Ok(())
@@ -60,13 +60,13 @@
 //! }
 //!
 //! # #[tokio::main(flavor = "current_thread")]
-//! # async fn main() -> nodus::anyhow::Result<()> {
+//! # async fn main() -> chorda::anyhow::Result<()> {
 //! let kernel = Kernel::new();
 //! let loader = Loader::new(&kernel);
 //!
 //! loader.register_entry_kind(entry_kind::<Echo>("echo"))?;
 //!
-//! let tree = nodus::EntryTree::from_json_str(
+//! let tree = chorda::EntryTree::from_json_str(
 //!     r#"[{ "id": "greeter", "plugin": "echo",
 //!          "config": { "prefix": "hello" } }]"#,
 //! )?;

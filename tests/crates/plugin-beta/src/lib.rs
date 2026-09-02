@@ -2,7 +2,7 @@
 //! so whether its registration survives linking is exactly what the
 //! `discovery` integration test observes.
 
-use nodus::{Ctx, Plugin};
+use chorda::{Ctx, Plugin};
 
 pub struct BetaPlugin;
 
@@ -12,18 +12,18 @@ impl Default for BetaPlugin {
     }
 }
 
-#[nodus::async_trait]
+#[chorda::async_trait]
 impl Plugin for BetaPlugin {
     fn name(&self) -> &str {
         "beta"
     }
 
-    async fn apply(&self, _ctx: Ctx) -> nodus::anyhow::Result<()> {
+    async fn apply(&self, _ctx: Ctx) -> chorda::anyhow::Result<()> {
         Ok(())
     }
 }
 
-nodus::register_plugin! {
+chorda::register_plugin! {
     name: "beta",
     build: BetaPlugin::default,
 }

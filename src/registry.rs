@@ -4,7 +4,7 @@
 //!
 //! ```ignore
 //! // in the plugin crate
-//! nodus::register_plugin! {
+//! chorda::register_plugin! {
 //!     name: "memory",
 //!     build: MemoryPlugin::default,
 //! }
@@ -63,18 +63,18 @@ inventory::collect!(PluginRegistration);
 /// ```
 /// use std::sync::Arc;
 ///
-/// use nodus::{Ctx, Plugin};
+/// use chorda::{Ctx, Plugin};
 ///
 /// struct DemoPlugin;
 ///
-/// #[nodus::async_trait]
+/// #[chorda::async_trait]
 /// impl Plugin for DemoPlugin {
-///     async fn apply(&self, _ctx: Ctx) -> nodus::anyhow::Result<()> {
+///     async fn apply(&self, _ctx: Ctx) -> chorda::anyhow::Result<()> {
 ///         Ok(())
 ///     }
 /// }
 ///
-/// nodus::register_plugin! {
+/// chorda::register_plugin! {
 ///     name: "demo",
 ///     build: || DemoPlugin,
 /// }

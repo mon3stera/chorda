@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use nodus::{Ctx, Kernel, Pipeline, fn_plugin};
+use chorda::{Ctx, Kernel, Pipeline, fn_plugin};
 
 type Shared<T> = Arc<std::sync::Mutex<T>>;
 
@@ -187,7 +187,7 @@ async fn prepends_run_before_appends_within_a_realm() {
         let entered = entered.clone();
         let name = name.to_owned();
 
-        let handler = move |messages: Vec<String>, next: nodus::Next<PreRequest>| {
+        let handler = move |messages: Vec<String>, next: chorda::Next<PreRequest>| {
             let entered = entered.clone();
             let name = name.clone();
 

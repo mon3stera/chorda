@@ -1,4 +1,4 @@
-# nodus
+# chorda
 
 A Cordis-inspired, **async-native plugin kernel** for Rust — the kernel of
 [h](https://github.com/mon3stera/h), a coding agent, where every subsystem
@@ -6,7 +6,7 @@ A Cordis-inspired, **async-native plugin kernel** for Rust — the kernel of
 runs as a plugin.
 
 Cordis-style kernels are usually built for synchronous, event-loop hosts.
-Nodus keeps the model — fibers, realms, declarative injection, scoped
+Chorda keeps the model — fibers, realms, declarative injection, scoped
 events — but rebuilds it for Tokio: plugins `await` through their setup,
 services resolve asynchronously, and disposal is an async drain, not a drop
 glue afterthought.
@@ -30,18 +30,18 @@ glue afterthought.
 ```rust
 use std::sync::Arc;
 
-use nodus::{Kernel, ServiceKey, State, fn_plugin};
+use chorda::{Kernel, ServiceKey, State, fn_plugin};
 
 struct Counter(u32);
 
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> nodus::anyhow::Result<()> {
+async fn main() -> chorda::anyhow::Result<()> {
     let kernel = Kernel::new();
     let root = kernel.root_ctx();
 
     // A plugin that declares what it needs; the kernel starts it when the
     // dependency appears.
-    let greeter = fn_plugin("greeter", |ctx: nodus::Ctx| async move {
+    let greeter = fn_plugin("greeter", |ctx: chorda::Ctx| async move {
         let counter = ctx.get::<Counter>().expect("counter injected");
         println!("counter = {}", counter.0);
 
@@ -85,7 +85,7 @@ idleness), then dispose everything before returning.
 
 ## Introspection
 
-[`Kernel::describe`](https://docs.rs/nodus) renders what a `nodus doctor`
+[`Kernel::describe`](https://docs.rs/chorda) renders what a `chorda doctor`
 would print — everything the kernel knows, in one snapshot:
 
 ```text
@@ -130,7 +130,7 @@ Where events notify, pipelines intercept. An extension point is a marker
 type declaring its `Input`, `Output`, and name; middlewares wrap the chain:
 
 ```rust
-use nodus::Pipeline;
+use chorda::Pipeline;
 
 struct ToolGate;
 
@@ -160,7 +160,7 @@ everything it links:
 
 ```rust
 // in the plugin crate
-nodus::register_plugin! {
+chorda::register_plugin! {
     name: "demo",
     build: || DemoPlugin,
 }
@@ -174,7 +174,7 @@ Registrations are sorted by name for deterministic startup.
 ## The loader: config-driven mounting
 
 Where `register_plugin!` handles compile-time discovery, the
-[`Loader`](https://docs.rs/nodus) handles runtime composition. A plugin
+[`Loader`](https://docs.rs/chorda) handles runtime composition. A plugin
 *kind* is a constructor from a config value (`ConfiguredPlugin`, with a
 JSON schema via `schemars`); an *entry* is one configured instance with a
 stable id:

@@ -5,7 +5,7 @@
 //! linker, registration and all; one `use plugin_crate as _;` line in the
 //! host binary is enough to keep it linked and discovered.
 
-use nodus::Kernel;
+use chorda::Kernel;
 
 #[tokio::test]
 async fn referenced_plugin_crates_are_discovered_and_registered() {
