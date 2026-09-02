@@ -5,10 +5,10 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org) — while the crates are 0.x,
 breaking changes land as minor bumps.
 
-## [0.2.0] — 2026-08-29
+## [0.2.0] — 2026-09-02
 
-The first release prepared for publication; everything below is relative to
-the unpublished 0.1.0 skeleton.
+The first feature-complete release; everything below is relative to the
+0.1.0 skeleton.
 
 ### Added
 
@@ -56,7 +56,7 @@ the unpublished 0.1.0 skeleton.
 - The crate is dual-licensed MIT OR Apache-2.0 and carries full package
   metadata for publication.
 
-## [0.1.0] — unpublished
+## [0.1.0] — 2026-09-02
 
 The initial skeleton: fibers, realms, scoped events, pipelines, and
-compile-time plugin discovery. Never published to crates.io.
+compile-time plugin discovery.
