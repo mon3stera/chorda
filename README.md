@@ -127,27 +127,37 @@ Use `emit`/`parallel` for observation, `serial`/`bail` for decisions,
 ## Pipelines: typed interception
 
 Where events notify, pipelines intercept. An extension point is a marker
-type declaring its `Input`, `Output`, and name; middlewares wrap the chain:
+type declaring its `Input`, `Output`, and name — and because a plugin's
+extension points are worth listing as a catalog, the `pipelines!` macro
+declares them one line at a time and registers each into a compile-time
+inventory:
 
-```rust
-use chorda::Pipeline;
+```rust,ignore
+chorda::pipelines! {
+    /// Wrapped around every provider stream open.
+    pub AgentPreRequest: Vec<Message> => anyhow::Result<Option<ProviderEventStream>>
+        = "h/agent/pre-request";
 
-struct ToolGate;
-
-impl Pipeline for ToolGate {
-    type Input = ToolCall;
-    type Output = ToolCallResult;
-    const NAME: &'static str = "h/agent/tool-gate";
+    /// Wrapped around every tool call.
+    pub AgentToolGate: ToolCall => ToolCallResult
+        = "h/agent/tool-gate";
 }
 
 // A plugin's apply:
-// ctx.middleware::<ToolGate>(|call, next| async move {
+// ctx.middleware::<AgentToolGate>(|call, next| async move {
 //     if forbidden(&call) {
 //         return ToolCallResult::denied(&call); // veto: next never runs
 //     }
 //     next.run(call).await; // continue into the rest of the chain
 // });
 ```
+
+A host binary that links several plugin crates can enumerate every
+extension point they carry with `chorda::pipeline_registrations()` — wire
+name, marker, input, and output types — without reading their source. The
+manual `impl Pipeline` form works identically for cases the macro does not
+cover. (The arrow is `=>`: `macro_rules!` forbids `->` directly after a
+type fragment.)
 
 The built-in behavior sits at the end of the chain; a middleware that never
 calls `next` vetoes it. `middleware_before` prepends a layer instead of
@@ -227,6 +237,6 @@ nothing auto-restarts it.
 
 ## Testing
 
-`cargo test` runs 63 tests, including a two-plugin workspace
+`cargo test` runs 69 tests, including a two-plugin workspace
 (`tests/crates/plugin-alpha`, `plugin-beta`) that exercises compile-time
 discovery end to end.
