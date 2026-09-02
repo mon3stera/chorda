@@ -159,3 +159,40 @@ pub fn discover_pipeline_names() -> Vec<String> {
         .map(|registration| registration.point.to_owned())
         .collect()
 }
+
+/// One compile-time registration of an event, submitted by the
+/// [`events!`](crate::events) macro.
+///
+/// Type names are stored as function pointers, as in
+/// [`PipelineRegistration`]; read them by calling the fields.
+#[derive(Clone, Copy)]
+pub struct EventRegistration {
+    /// The event's wire name (`Event::NAME`).
+    pub point: &'static str,
+    /// The event newtype's path.
+    pub marker: fn() -> &'static str,
+    /// The payload type's path.
+    pub payload: fn() -> &'static str,
+    /// The decision type's path (`Event::Output`).
+    pub output: fn() -> &'static str,
+}
+
+inventory::collect!(EventRegistration);
+
+/// Every event the binary linked in, sorted by wire name.
+pub fn event_registrations() -> Vec<EventRegistration> {
+    let mut registrations: Vec<EventRegistration> =
+        inventory::iter::<EventRegistration>().copied().collect();
+
+    registrations.sort_by(|a, b| a.point.cmp(b.point));
+
+    registrations
+}
+
+/// The wire names of all registered events.
+pub fn discover_event_names() -> Vec<String> {
+    event_registrations()
+        .into_iter()
+        .map(|registration| registration.point.to_owned())
+        .collect()
+}

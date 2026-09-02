@@ -65,7 +65,7 @@ mod service;
 pub use anyhow;
 pub use async_trait::async_trait;
 pub use context::{Ctx, RealmId};
-pub use events::{EventAggregate, EventNext, Events, HandlerId};
+pub use events::{Event, EventAggregate, EventNext, Events, HandlerId};
 pub use fiber::{FiberHandle, FiberId, State};
 pub use inventory;
 pub use kernel::Kernel;
@@ -75,7 +75,8 @@ pub use loader::{
 pub use pipeline::{Next, Pipeline, PipelineId};
 pub use plugin::{FnPlugin, Plugin, fn_plugin};
 pub use registry::{
-    PipelineRegistration, PluginRegistration, discover_pipeline_names, discover_plugin_names,
-    pipeline_registrations, plugin_registrations,
+    EventRegistration, PipelineRegistration, PluginRegistration, discover_event_names,
+    discover_pipeline_names, discover_plugin_names, event_registrations, pipeline_registrations,
+    plugin_registrations,
 };
 pub use service::ServiceKey;

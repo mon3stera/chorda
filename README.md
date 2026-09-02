@@ -109,17 +109,48 @@ unlabeled.
 
 ## Events: five dispatch modes
 
+Every event implements the `Event` trait, which binds it to its wire name and
+— the load-bearing part — to its **decision type**:
+
+```rust,ignore
+pub trait Event: Clone + Send + Sync + 'static {
+    type Output: Send + 'static;
+
+    const NAME: &'static str;
+}
+```
+
 Handlers are registered on a fiber (`ctx.on`, `ctx.on_bail`, `ctx.on_serial`,
 `ctx.on_waterfall`), scoped to its realm, removed with the fiber, and reached
-by emissions from descendant realms (bubbling, innermost realm first).
+by emissions from descendant realms (bubbling, innermost realm first). The
+decision-returning dispatches read `E::Output`, so a handler and its dispatch
+cannot disagree on the decision type — the failure mode of a free `R`
+parameter (register `<E, String>`, dispatch `<E, u32>`, silence) cannot
+compile.
 
 | Dispatch | Handlers | Waits | Short-circuits |
 |---|---|---|---|
 | `emit` | async observers | never (detached) | never |
 | `parallel` | async observers | all, concurrently | never — panics aggregate into `EventAggregate` |
-| `serial` | async deciders `→ Option<R>` | one by one | first decision |
-| `bail` | **sync** deciders `→ Option<R>` | never | first decision |
+| `serial` | async deciders `→ Option<E::Output>` | one by one | first decision |
+| `bail` | **sync** deciders `→ Option<E::Output>` | never | first decision |
 | `waterfall` | onion layers around a built-in | composed | a layer skipping `next` vetoes everything inside it |
+
+The `events!` macro declares event newtypes one line at a time — payload
+newtype, `Event` impl, and compile-time catalog registration:
+
+```rust,ignore
+chorda::events! {
+    /// Fired for every finished turn.
+    pub TurnFinished: TurnReport => () = "h/agent/turn-finished";
+
+    /// A permission decision for a tool call.
+    pub ToolPermission: ToolCall => bool = "h/agent/tool-permission";
+}
+```
+
+Hosts enumerate the events their plugin set carries with
+`chorda::event_registrations()` — wire name, payload, and decision types.
 
 Use `emit`/`parallel` for observation, `serial`/`bail` for decisions,
 `waterfall` for composition.
@@ -237,6 +268,6 @@ nothing auto-restarts it.
 
 ## Testing
 
-`cargo test` runs 69 tests, including a two-plugin workspace
+`cargo test` runs 72 tests, including a two-plugin workspace
 (`tests/crates/plugin-alpha`, `plugin-beta`) that exercises compile-time
 discovery end to end.

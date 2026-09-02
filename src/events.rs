@@ -3,9 +3,16 @@
 //!
 //! Events are the extension surface between the agent loop and the plugins
 //! around it. The layer mirrors cordis's event service: one registration
-//! families per dispatch mode, all scoped to the registering fiber's realm,
+//! family per dispatch mode, all scoped to the registering fiber's realm,
 //! all bubbling from the emitting realm up through its ancestors, all
 //! removing themselves when their fiber is disposed.
+//!
+//! Every event implements [`Event`], which binds the event to its wire name
+//! and — the load-bearing part — to its **decision type**
+//! ([`Event::Output`]). The `serial`, `bail`, and `waterfall` dispatches
+//! return and receive `E::Output`, so the decision type has one definition
+//! site: registering a handler and dispatching the event cannot disagree on
+//! it, the way a free type parameter could.
 //!
 //! The five modes, as in cordis:
 //!
@@ -21,6 +28,10 @@
 //! mode. A panicking observer is logged and skipped in `emit`, `parallel`,
 //! and `serial`; a panicking waterfall layer propagates, because the rest of
 //! the onion cannot be resumed without the layer's cooperation.
+//!
+//! The [`events!`] macro declares event newtypes, their [`Event`] impls, and
+//! their compile-time catalog registrations one line at a time — the
+//! [`pipelines!`](crate::pipelines) counterpart for notification points.
 
 use std::any::{Any, TypeId};
 use std::panic::AssertUnwindSafe;
@@ -31,6 +42,24 @@ use futures::future::{BoxFuture, FutureExt};
 use crate::context::Ctx;
 use crate::fiber::panic_message;
 use crate::kernel::{EventHandler, EventKey, EventKind};
+
+/// Binds an event type to its wire name and decision type.
+///
+/// `Output` is the type a `serial`, `bail`, or `waterfall` dispatch of this
+/// event produces. Because handlers and dispatches both read it from the
+/// event, the decision type has a single definition site — the class of bug
+/// where a handler registered for `<E, String>` silently never fires for a
+/// dispatch typed `<E, u32>` cannot be written. Pure observation events
+/// declare `type Output = ();`.
+pub trait Event: Clone + Send + Sync + 'static {
+    /// The decision type carried by `serial`, `bail`, and `waterfall`
+    /// dispatches of this event.
+    type Output: Send + 'static;
+
+    /// Human-readable wire name, used for diagnostics and the compile-time
+    /// event catalog.
+    const NAME: &'static str;
+}
 
 /// A family-typed handler box stored in the kernel registry; the dispatch
 /// site knows the concrete type and downcasts.
@@ -48,30 +77,40 @@ type ObserverRun<E> = Arc<dyn Fn(E) -> BoxFuture<'static, ()> + Send + Sync>;
 
 /// Shared run shape of one synchronous decider: inspects the event without
 /// awaiting and either passes (`None`) or decides (`Some`).
-type BailRun<E, R> = Arc<dyn Fn(&E) -> Option<R> + Send + Sync>;
+///
+/// The alias bound is not enforced at use sites (rustc's `type_alias_bounds`);
+/// it exists so `E::Output` projects, and every boxed handler type repeats it
+/// as a real constraint.
+#[allow(type_alias_bounds)]
+type BailRun<E: Event> = Arc<dyn Fn(&E) -> Option<E::Output> + Send + Sync>;
 
-/// Shared run shape of one asynchronous decider.
-type SerialRun<E, R> = Arc<dyn Fn(E) -> BoxFuture<'static, Option<R>> + Send + Sync>;
+/// Shared run shape of one asynchronous decider. See [`BailRun`] for the
+/// alias-bound caveat.
+#[allow(type_alias_bounds)]
+type SerialRun<E: Event> = Arc<dyn Fn(E) -> BoxFuture<'static, Option<E::Output>> + Send + Sync>;
 
 /// Shared run shape of one waterfall layer: receives the event and the rest
 /// of the onion. Calling [`EventNext::run`] continues; returning without it
-/// vetoes the rest of the chain, including the built-in behavior.
-type WaterfallRun<E, R> = Arc<dyn Fn(E, EventNext<E, R>) -> BoxFuture<'static, R> + Send + Sync>;
+/// vetoes the rest of the chain, including the built-in behavior. See
+/// [`BailRun`] for the alias-bound caveat.
+#[allow(type_alias_bounds)]
+type WaterfallRun<E: Event> =
+    Arc<dyn Fn(E, EventNext<E>) -> BoxFuture<'static, E::Output> + Send + Sync>;
 
 struct ObserverBox<E> {
     run: ObserverRun<E>,
 }
 
-struct BailBox<E, R> {
-    run: BailRun<E, R>,
+struct BailBox<E: Event> {
+    run: BailRun<E>,
 }
 
-struct SerialBox<E, R> {
-    run: SerialRun<E, R>,
+struct SerialBox<E: Event> {
+    run: SerialRun<E>,
 }
 
-struct WaterfallBox<E, R> {
-    run: WaterfallRun<E, R>,
+struct WaterfallBox<E: Event> {
+    run: WaterfallRun<E>,
 }
 
 fn observer_key<E: 'static>() -> EventKey {
@@ -82,11 +121,11 @@ fn observer_key<E: 'static>() -> EventKey {
     }
 }
 
-fn decider_key<E: 'static, R: 'static>(kind: EventKind) -> EventKey {
+fn decider_key<E: Event>(kind: EventKind) -> EventKey {
     EventKey {
         kind,
         event: TypeId::of::<E>(),
-        result: Some(TypeId::of::<R>()),
+        result: Some(TypeId::of::<E::Output>()),
     }
 }
 
@@ -115,13 +154,13 @@ fn register(ctx: &Ctx, key: EventKey, body: HandlerBody) -> HandlerId {
 ///
 /// Cloning is cheap; a layer may run the rest of the chain more than once by
 /// cloning or by holding `&self` across calls.
-pub struct EventNext<E, R> {
-    chain: Arc<[WaterfallRun<E, R>]>,
+pub struct EventNext<E: Event> {
+    chain: Arc<[WaterfallRun<E>]>,
     index: usize,
-    fallback: Arc<dyn Fn() -> BoxFuture<'static, R> + Send + Sync>,
+    fallback: Arc<dyn Fn() -> BoxFuture<'static, E::Output> + Send + Sync>,
 }
 
-impl<E, R> Clone for EventNext<E, R> {
+impl<E: Event> Clone for EventNext<E> {
     fn clone(&self) -> Self {
         Self {
             chain: Arc::clone(&self.chain),
@@ -131,15 +170,14 @@ impl<E, R> Clone for EventNext<E, R> {
     }
 }
 
-impl<E, R> EventNext<E, R>
+impl<E> EventNext<E>
 where
-    E: Clone + Send + Sync + 'static,
-    R: Send + 'static,
+    E: Event,
 {
     fn entry(
-        chain: Arc<[WaterfallRun<E, R>]>,
+        chain: Arc<[WaterfallRun<E>]>,
         index: usize,
-        fallback: Arc<dyn Fn() -> BoxFuture<'static, R> + Send + Sync>,
+        fallback: Arc<dyn Fn() -> BoxFuture<'static, E::Output> + Send + Sync>,
     ) -> Self {
         Self {
             chain,
@@ -151,7 +189,7 @@ where
     /// Runs the rest of the chain, ending at the built-in behavior. The event
     /// is passed on unchanged; a layer that wants to transform what the rest
     /// of the chain sees wraps the event itself before emitting.
-    pub fn run(&self, event: E) -> BoxFuture<'static, R> {
+    pub fn run(&self, event: E) -> BoxFuture<'static, E::Output> {
         let Some(run) = self.chain.get(self.index) else {
             return (self.fallback)();
         };
@@ -203,7 +241,7 @@ impl Events {
     /// when the caller must know every handler has finished.
     pub fn emit<E>(&self, event: &E)
     where
-        E: Clone + Send + Sync + 'static,
+        E: Event,
     {
         let handlers = self.handlers(observer_key::<E>());
 
@@ -237,7 +275,7 @@ impl Events {
     /// aggregated.
     pub async fn parallel<E>(&self, event: &E) -> Result<(), EventAggregate>
     where
-        E: Clone + Send + Sync + 'static,
+        E: Event,
     {
         let handlers = self.handlers(observer_key::<E>());
 
@@ -279,12 +317,11 @@ impl Events {
     /// decides. A panicking handler is logged and skipped.
     ///
     /// Returns the first decision, or `None` when every handler passed.
-    pub async fn serial<E, R>(&self, event: &E) -> Option<R>
+    pub async fn serial<E>(&self, event: &E) -> Option<E::Output>
     where
-        E: Clone + Send + Sync + 'static,
-        R: Send + 'static,
+        E: Event,
     {
-        let handlers = self.handlers(decider_key::<E, R>(EventKind::Serial));
+        let handlers = self.handlers(decider_key::<E>(EventKind::Serial));
 
         for handler in handlers {
             if !self.kernel.is_active(handler.fiber) {
@@ -293,7 +330,7 @@ impl Events {
 
             let run = handler
                 .body
-                .downcast_ref::<SerialBox<E, R>>()
+                .downcast_ref::<SerialBox<E>>()
                 .expect("serial handler body mismatch")
                 .run
                 .clone();
@@ -315,12 +352,11 @@ impl Events {
     /// Runs synchronous deciders in order until one decides. Like
     /// [`Events::serial`], but the handlers cannot await: use it for instant
     /// decisions over in-memory state, such as permission checks.
-    pub fn bail<E, R>(&self, event: &E) -> Option<R>
+    pub fn bail<E>(&self, event: &E) -> Option<E::Output>
     where
-        E: Clone + Send + Sync + 'static,
-        R: Send + 'static,
+        E: Event,
     {
-        let handlers = self.handlers(decider_key::<E, R>(EventKind::Bail));
+        let handlers = self.handlers(decider_key::<E>(EventKind::Bail));
 
         for handler in handlers {
             if !self.kernel.is_active(handler.fiber) {
@@ -329,7 +365,7 @@ impl Events {
 
             let run = handler
                 .body
-                .downcast_ref::<BailBox<E, R>>()
+                .downcast_ref::<BailBox<E>>()
                 .expect("bail handler body mismatch")
                 .run
                 .clone();
@@ -357,22 +393,21 @@ impl Events {
     ///
     /// A panicking layer propagates the panic to the caller: the rest of the
     /// onion cannot be resumed without the layer's cooperation.
-    pub async fn waterfall<E, R, F, Fut>(&self, event: &E, builtin: F) -> R
+    pub async fn waterfall<E, F, Fut>(&self, event: &E, builtin: F) -> E::Output
     where
-        E: Clone + Send + Sync + 'static,
-        R: Send + 'static,
+        E: Event,
         F: FnOnce(E) -> Fut + Send + 'static,
-        Fut: Future<Output = R> + Send + 'static,
+        Fut: Future<Output = E::Output> + Send + 'static,
     {
-        let handlers = self.handlers(decider_key::<E, R>(EventKind::Waterfall));
+        let handlers = self.handlers(decider_key::<E>(EventKind::Waterfall));
 
-        let runs: Vec<WaterfallRun<E, R>> = handlers
+        let runs: Vec<WaterfallRun<E>> = handlers
             .into_iter()
             .filter(|handler| self.kernel.is_active(handler.fiber))
             .map(|handler| {
                 handler
                     .body
-                    .downcast_ref::<WaterfallBox<E, R>>()
+                    .downcast_ref::<WaterfallBox<E>>()
                     .expect("waterfall handler body mismatch")
                     .run
                     .clone()
@@ -384,15 +419,16 @@ impl Events {
         // is the honest report of an unsupported composition.
         let payload = event.clone();
         let builtin = std::sync::Mutex::new(Some(builtin));
-        let fallback: Arc<dyn Fn() -> BoxFuture<'static, R> + Send + Sync> = Arc::new(move || {
-            let mut slot = builtin.lock().expect("waterfall fallback lock poisoned");
-            let builtin = slot
-                .take()
-                .expect("the waterfall built-in behavior ran more than once");
-            Box::pin(builtin(payload.clone()))
-        });
+        let fallback: Arc<dyn Fn() -> BoxFuture<'static, E::Output> + Send + Sync> =
+            Arc::new(move || {
+                let mut slot = builtin.lock().expect("waterfall fallback lock poisoned");
+                let builtin = slot
+                    .take()
+                    .expect("the waterfall built-in behavior ran more than once");
+                Box::pin(builtin(payload.clone()))
+            });
 
-        let chain: Arc<[WaterfallRun<E, R>]> = runs.into();
+        let chain: Arc<[WaterfallRun<E>]> = runs.into();
         let next = EventNext::entry(chain, 0, fallback);
 
         next.run(event.clone()).await
@@ -414,7 +450,7 @@ impl Ctx {
     /// serves the [`Events::emit`] and [`Events::parallel`] dispatches.
     pub fn on<E, F, Fut>(&self, handler: F) -> HandlerId
     where
-        E: Clone + Send + Sync + 'static,
+        E: Event,
         F: Fn(E) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
@@ -427,43 +463,43 @@ impl Ctx {
 
     /// Registers a synchronous decider for events of type `E`, scoped to
     /// this fiber. Serves [`Events::bail`]: returning `Some` decides and
-    /// short-circuits the dispatch, `None` passes.
-    pub fn on_bail<E, R, F>(&self, handler: F) -> HandlerId
+    /// short-circuits the dispatch, `None` passes. The decision type is the
+    /// event's [`Event::Output`].
+    pub fn on_bail<E, F>(&self, handler: F) -> HandlerId
     where
-        E: Clone + Send + Sync + 'static,
-        R: Send + 'static,
-        F: Fn(&E) -> Option<R> + Send + Sync + 'static,
+        E: Event,
+        F: Fn(&E) -> Option<E::Output> + Send + Sync + 'static,
     {
         self.kernel.note_type::<E>();
-        self.kernel.note_type::<R>();
+        self.kernel.note_type::<E::Output>();
 
-        let run: BailRun<E, R> = Arc::new(handler);
+        let run: BailRun<E> = Arc::new(handler);
 
         register(
             self,
-            decider_key::<E, R>(EventKind::Bail),
+            decider_key::<E>(EventKind::Bail),
             Arc::new(BailBox { run }),
         )
     }
 
     /// Registers an asynchronous decider for events of type `E`, scoped to
     /// this fiber. Serves [`Events::serial`]: the first handler to return
-    /// `Some` decides and short-circuits the dispatch.
-    pub fn on_serial<E, R, F, Fut>(&self, handler: F) -> HandlerId
+    /// `Some` decides and short-circuits the dispatch. The decision type is
+    /// the event's [`Event::Output`].
+    pub fn on_serial<E, F, Fut>(&self, handler: F) -> HandlerId
     where
-        E: Clone + Send + Sync + 'static,
-        R: Send + 'static,
+        E: Event,
         F: Fn(E) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Option<R>> + Send + 'static,
+        Fut: Future<Output = Option<E::Output>> + Send + 'static,
     {
         self.kernel.note_type::<E>();
-        self.kernel.note_type::<R>();
+        self.kernel.note_type::<E::Output>();
 
-        let run: SerialRun<E, R> = Arc::new(move |event| Box::pin(handler(event)));
+        let run: SerialRun<E> = Arc::new(move |event| Box::pin(handler(event)));
 
         register(
             self,
-            decider_key::<E, R>(EventKind::Serial),
+            decider_key::<E>(EventKind::Serial),
             Arc::new(SerialBox { run }),
         )
     }
@@ -471,21 +507,20 @@ impl Ctx {
     /// Registers a waterfall layer for events of type `E`, scoped to this
     /// fiber. Serves [`Events::waterfall`]: the first-registered layer is the
     /// outermost.
-    pub fn on_waterfall<E, R, F, Fut>(&self, handler: F) -> HandlerId
+    pub fn on_waterfall<E, F, Fut>(&self, handler: F) -> HandlerId
     where
-        E: Clone + Send + Sync + 'static,
-        R: Send + 'static,
-        F: Fn(E, EventNext<E, R>) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = R> + Send + 'static,
+        E: Event,
+        F: Fn(E, EventNext<E>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = E::Output> + Send + 'static,
     {
         self.kernel.note_type::<E>();
-        self.kernel.note_type::<R>();
+        self.kernel.note_type::<E::Output>();
 
-        let run: WaterfallRun<E, R> = Arc::new(move |event, next| Box::pin(handler(event, next)));
+        let run: WaterfallRun<E> = Arc::new(move |event, next| Box::pin(handler(event, next)));
 
         register(
             self,
-            decider_key::<E, R>(EventKind::Waterfall),
+            decider_key::<E>(EventKind::Waterfall),
             Arc::new(WaterfallBox { run }),
         )
     }
@@ -493,7 +528,69 @@ impl Ctx {
     /// Emits an event of type `E` to this realm's observers, detached.
     ///
     /// Equivalent to [`Ctx::events`].[`Events::emit`].
-    pub fn emit<E: Clone + Send + Sync + 'static>(&self, event: &E) {
+    pub fn emit<E: Event>(&self, event: &E) {
         self.events().emit(event);
     }
+}
+
+/// Declares event newtypes, their [`Event`] impls, and their compile-time
+/// catalog registrations, one line at a time — the
+/// [`pipelines!`](crate::pipelines) counterpart for notification points.
+/// The doc comment becomes the newtype's doc; the wire name after `=` becomes
+/// [`Event::NAME`].
+///
+/// The generated type is a newtype over the payload, so construction is
+/// `GateDecision(call)` and handlers read `.0`. A `()` output marks a pure
+/// observation event; a meaningful output serves the `serial`, `bail`, and
+/// `waterfall` dispatches.
+///
+/// # Example
+///
+/// ```
+/// use chorda::Event;
+///
+/// chorda::events! {
+///     /// Fired for every finished turn.
+///     pub TurnFinished: u8 => () = "test/turn-finished";
+///
+///     /// A gate decision for a tool call.
+///     pub GateDecision: String => bool = "test/gate-decision";
+/// }
+///
+/// # fn main() {
+/// assert_eq!(GateDecision::NAME, "test/gate-decision");
+///
+/// assert!(chorda::discover_event_names().contains(&"test/turn-finished".to_owned()));
+/// # }
+/// ```
+///
+/// Like [`register_plugin!`](crate::register_plugin), the submitting crate
+/// needs `inventory` in its dependencies for the registration to link.
+#[macro_export]
+macro_rules! events {
+    ($(
+        $(#[$meta:meta])*
+        $vis:vis $name:ident : $payload:ty => $output:ty = $point:expr
+    );* $(;)?) => {
+        $(
+            $(#[$meta])*
+            #[derive(Debug, Clone)]
+            $vis struct $name(pub $payload);
+
+            impl $crate::Event for $name {
+                type Output = $output;
+
+                const NAME: &'static str = $point;
+            }
+
+            ::inventory::submit! {
+                $crate::EventRegistration {
+                    point: $point,
+                    marker: std::any::type_name::<$name>,
+                    payload: std::any::type_name::<$payload>,
+                    output: std::any::type_name::<$output>,
+                }
+            }
+        )*
+    };
 }

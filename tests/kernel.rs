@@ -339,6 +339,23 @@ async fn disposing_a_starting_fiber_aborts_setup_and_runs_effects() {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Message(&'static str);
 
+impl chorda::Event for Message {
+    type Output = &'static str;
+
+    const NAME: &'static str = "test/message";
+}
+
+/// A waterfall-only event whose decision type owns its data.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct Rich(&'static str);
+
+impl chorda::Event for Rich {
+    type Output = String;
+
+    const NAME: &'static str = "test/rich";
+}
+
 #[tokio::test]
 async fn events_reach_scoped_handlers_and_die_with_the_fiber() {
     let kernel = Kernel::new();
@@ -1072,10 +1089,7 @@ async fn serial_stops_at_the_first_decision() {
         });
     }
 
-    let decision = root
-        .events()
-        .serial::<Message, &'static str>(&Message("go"))
-        .await;
+    let decision = root.events().serial::<Message>(&Message("go")).await;
 
     assert_eq!(decision, Some("decided"));
     assert_eq!(
@@ -1092,8 +1106,8 @@ async fn bail_decides_without_awaiting() {
 
     root.on_bail(|event: &Message| (event.0 == "blocked").then_some("denied"));
 
-    let blocked = root.events().bail::<Message, &str>(&Message("blocked"));
-    let allowed = root.events().bail::<Message, &str>(&Message("allowed"));
+    let blocked = root.events().bail::<Message>(&Message("blocked"));
+    let allowed = root.events().bail::<Message>(&Message("allowed"));
 
     assert_eq!(blocked, Some("denied"));
     assert_eq!(allowed, None);
@@ -1114,14 +1128,14 @@ async fn deciders_die_with_their_fiber() {
     fiber.wait_ready().await.unwrap();
 
     assert_eq!(
-        root.events().bail::<Message, &str>(&Message("x")),
+        root.events().bail::<Message>(&Message("x")),
         Some("guarded")
     );
 
     fiber.dispose().await;
 
     assert_eq!(
-        root.events().bail::<Message, &str>(&Message("x")),
+        root.events().bail::<Message>(&Message("x")),
         None,
         "deciders must be removed with their fiber"
     );
@@ -1132,25 +1146,19 @@ async fn waterfall_composes_around_the_builtin_and_can_veto() {
     let kernel = Kernel::new();
     let root = kernel.root_ctx();
 
-    root.on_waterfall(
-        |_event: Message, next: EventNext<Message, String>| async move {
-            let inner = next.run(_event).await;
-            format!("outer({inner})")
-        },
-    );
+    root.on_waterfall(|_event: Rich, next: EventNext<Rich>| async move {
+        let inner = next.run(_event).await;
+        format!("outer({inner})")
+    });
 
-    root.on_waterfall(
-        |_event: Message, next: EventNext<Message, String>| async move {
-            let inner = next.run(_event).await;
-            format!("inner({inner})")
-        },
-    );
+    root.on_waterfall(|_event: Rich, next: EventNext<Rich>| async move {
+        let inner = next.run(_event).await;
+        format!("inner({inner})")
+    });
 
     let composed = root
         .events()
-        .waterfall(&Message("go"), |_event: Message| async {
-            "core".to_owned()
-        })
+        .waterfall(&Rich("go"), |_event: Rich| async { "core".to_owned() })
         .await;
 
     assert_eq!(
@@ -1163,15 +1171,11 @@ async fn waterfall_composes_around_the_builtin_and_can_veto() {
     let kernel = Kernel::new();
     let root = kernel.root_ctx();
 
-    root.on_waterfall(
-        |_event: Message, _next: EventNext<Message, String>| async move { "vetoed".to_owned() },
-    );
+    root.on_waterfall(|_event: Rich, _next: EventNext<Rich>| async move { "vetoed".to_owned() });
 
     let vetoed = root
         .events()
-        .waterfall(&Message("go"), |_event: Message| async {
-            "core".to_owned()
-        })
+        .waterfall(&Rich("go"), |_event: Rich| async { "core".to_owned() })
         .await;
 
     assert_eq!(
@@ -1270,11 +1274,81 @@ async fn deciders_bubble_up_to_ancestor_realms() {
 
     root.on_bail(|event: &Message| (event.0 == "escalate").then_some("handled-upstairs"));
 
-    let decision = child.events().bail::<Message, &str>(&Message("escalate"));
+    let decision = child.events().bail::<Message>(&Message("escalate"));
 
     assert_eq!(
         decision,
         Some("handled-upstairs"),
         "child dispatches must consult ancestor deciders"
     );
+}
+
+chorda::events! {
+    /// A macro-declared observation event.
+    pub MacroTick: u8 => () = "test/macro-tick";
+
+    /// A macro-declared decision event.
+    pub MacroGate: String => bool = "test/macro-gate";
+}
+
+#[tokio::test]
+async fn the_events_macro_declares_dispatchable_newtypes() {
+    let kernel = Kernel::new();
+    let root = kernel.root_ctx();
+
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let recorded = Arc::clone(&seen);
+    root.on(move |event: MacroTick| {
+        let recorded = Arc::clone(&recorded);
+        async move {
+            recorded.lock().expect("seen lock").push(event.0);
+        }
+    });
+
+    root.on_bail(|event: &MacroGate| (event.0 == "block").then_some(true));
+
+    root.events().emit(&MacroTick(7));
+    root.events()
+        .parallel(&MacroTick(9))
+        .await
+        .expect("observers");
+
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+    let mut ticks = seen.lock().expect("seen lock").clone();
+    ticks.sort();
+
+    assert_eq!(ticks, vec![7, 9], "both observers received both ticks");
+
+    assert_eq!(
+        root.events()
+            .bail::<MacroGate>(&MacroGate("block".to_owned())),
+        Some(true)
+    );
+
+    assert_eq!(
+        root.events()
+            .bail::<MacroGate>(&MacroGate("pass".to_owned())),
+        None
+    );
+
+    kernel.dispose().await;
+}
+
+#[test]
+fn the_events_macro_registers_a_catalog() {
+    let names = chorda::discover_event_names();
+
+    assert!(names.contains(&"test/macro-tick".to_owned()));
+    assert!(names.contains(&"test/macro-gate".to_owned()));
+
+    let registration = chorda::event_registrations()
+        .into_iter()
+        .find(|registration| registration.point == "test/macro-gate")
+        .expect("the macro registered the event");
+
+    assert!((registration.output)().contains("bool"));
+    assert!((registration.payload)().contains("String"));
+    assert!((registration.marker)().contains("MacroGate"));
 }
