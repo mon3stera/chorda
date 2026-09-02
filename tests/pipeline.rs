@@ -349,3 +349,65 @@ async fn an_empty_chain_falls_straight_through_to_the_fallback() {
 fn labels(joined: &str) -> Vec<String> {
     joined.split(',').map(str::to_owned).collect()
 }
+
+chorda::pipelines! {
+    /// Wrapped around every tool call in the macro test.
+    pub TestGate: u8 => u8 = "test/macro-gate";
+
+    /// A fallible point; the output type is an ordinary type.
+    pub TestFallible: String => anyhow::Result<Option<String>> = "test/macro-fallible";
+}
+
+#[tokio::test]
+async fn the_pipelines_macro_declares_working_markers() {
+    let kernel = Kernel::new();
+    let root = kernel.root_ctx();
+
+    root.middleware::<TestGate, _, _>(|input, next| async move { next.run(input + 1).await });
+
+    let output = root
+        .waterfall::<TestGate, _, _>(1_u8, |input| async move { input * 10 })
+        .await;
+
+    assert_eq!(
+        output, 20,
+        "middleware wraps the builtin through the macro marker"
+    );
+
+    let fallible = root
+        .waterfall::<TestFallible, _, _>("hi".to_owned(), |input| async move {
+            Ok::<_, anyhow::Error>(Some(input.to_uppercase()))
+        })
+        .await;
+
+    assert_eq!(fallible.unwrap(), Some("HI".to_owned()));
+
+    kernel.dispose().await;
+}
+
+#[test]
+fn the_pipelines_macro_registers_a_catalog() {
+    let names = chorda::discover_pipeline_names();
+
+    assert!(names.contains(&"test/macro-gate".to_owned()));
+    assert!(names.contains(&"test/macro-fallible".to_owned()));
+
+    let registration = chorda::pipeline_registrations()
+        .into_iter()
+        .find(|registration| registration.point == "test/macro-gate")
+        .expect("the macro registered the point");
+
+    assert!((registration.input)().contains("u8"));
+    assert!((registration.output)().contains("u8"));
+    assert!((registration.marker)().contains("TestGate"));
+
+    let fallible = chorda::pipeline_registrations()
+        .into_iter()
+        .find(|registration| registration.point == "test/macro-fallible")
+        .expect("the macro registered the fallible point");
+
+    let output = (fallible.output)();
+
+    assert!(output.contains("Result<"), "{output}");
+    assert!(output.contains("String"), "{output}");
+}

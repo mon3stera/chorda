@@ -118,3 +118,44 @@ pub fn discover_plugin_names() -> Vec<String> {
         .map(|registration| registration.name.to_owned())
         .collect()
 }
+
+/// One compile-time registration of a pipeline extension point, submitted
+/// by the [`pipelines!`](crate::pipelines) macro.
+///
+/// The type names are stored as function pointers because
+/// `std::any::type_name` is not const-callable on every toolchain; read
+/// them through [`PipelineRegistration::input`] and friends.
+#[derive(Clone, Copy)]
+pub struct PipelineRegistration {
+    /// The extension point's wire name (`Pipeline::NAME`).
+    pub point: &'static str,
+    /// The marker type's path, resolved lazily — `std::any::type_name` is
+    /// not const-callable, so the registration stores function pointers.
+    pub marker: fn() -> &'static str,
+    /// The input type's path.
+    pub input: fn() -> &'static str,
+    /// The output type's path.
+    pub output: fn() -> &'static str,
+}
+
+inventory::collect!(PipelineRegistration);
+
+/// Every pipeline extension point the binary linked in, sorted by wire
+/// name. The catalog of a plugin ecosystem: hosts can list the extension
+/// points their plugin set carries without reading its source.
+pub fn pipeline_registrations() -> Vec<PipelineRegistration> {
+    let mut registrations: Vec<PipelineRegistration> =
+        inventory::iter::<PipelineRegistration>().copied().collect();
+
+    registrations.sort_by(|a, b| a.point.cmp(b.point));
+
+    registrations
+}
+
+/// The wire names of all registered pipeline extension points.
+pub fn discover_pipeline_names() -> Vec<String> {
+    pipeline_registrations()
+        .into_iter()
+        .map(|registration| registration.point.to_owned())
+        .collect()
+}

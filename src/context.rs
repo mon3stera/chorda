@@ -109,7 +109,10 @@ impl Ctx {
                 .provides
                 .lock()
                 .expect("provides lock poisoned")
-                .push(ProvidedService { key: key.clone() });
+                .push(ProvidedService {
+                    key: key.clone(),
+                    realm: self.realm,
+                });
 
             let kernel = self.kernel.clone();
             let cleanup_realm = self.realm;
@@ -124,7 +127,7 @@ impl Ctx {
         let replaced = previous.is_some_and(|old| !Arc::ptr_eq(&old, &erased));
 
         if replaced {
-            for dependent in self.kernel.dependents_of(&key, self.fiber) {
+            for dependent in self.kernel.dependents_of(self.realm, &key, self.fiber) {
                 dispose_fiber(self.kernel.clone(), dependent, State::Disposed).await;
             }
         }

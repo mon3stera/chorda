@@ -74,5 +74,8 @@ pub use loader::{
 };
 pub use pipeline::{Next, Pipeline, PipelineId};
 pub use plugin::{FnPlugin, Plugin, fn_plugin};
-pub use registry::{PluginRegistration, discover_plugin_names, plugin_registrations};
+pub use registry::{
+    PipelineRegistration, PluginRegistration, discover_pipeline_names, discover_plugin_names,
+    pipeline_registrations, plugin_registrations,
+};
 pub use service::ServiceKey;

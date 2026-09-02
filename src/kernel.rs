@@ -363,12 +363,20 @@ impl KernelInner {
             .collect()
     }
 
+    /// The fibers that resolved `key` to the binding held by `realm` and must
+    /// therefore be disconnected when that binding goes away.
+    ///
+    /// Injecting the same key is not enough: a fiber in a sibling realm that
+    /// shadows the key resolved a different value entirely and must be left
+    /// alone, or realms would not isolate anything.
     pub(crate) fn dependents_of(
         &self,
+        realm: RealmId,
         key: &ServiceKey,
         exclude: FiberId,
     ) -> Vec<Arc<FiberShared>> {
-        self.fibers
+        let injectors: Vec<Arc<FiberShared>> = self
+            .fibers
             .lock()
             .expect("fibers lock poisoned")
             .iter()
@@ -384,7 +392,30 @@ impl KernelInner {
                         .any(|injected| injected == key)
             })
             .map(|(_, fiber)| fiber.clone())
+            .collect();
+
+        injectors
+            .into_iter()
+            .filter(|fiber| self.resolving_realm(fiber.realm, key) == Some(realm))
             .collect()
+    }
+
+    /// The realm whose binding wins a lookup of `key` from `realm`, if any.
+    pub(crate) fn resolving_realm(&self, realm: RealmId, key: &ServiceKey) -> Option<RealmId> {
+        let realms = self.realms.lock().expect("realms lock poisoned");
+        let mut next = Some(realm);
+
+        while let Some(current) = next {
+            let node = realms.get(&current)?;
+
+            if node.services.contains_key(key) {
+                return Some(current);
+            }
+
+            next = node.parent;
+        }
+
+        None
     }
 
     pub(crate) fn remove_fiber(&self, id: FiberId) {

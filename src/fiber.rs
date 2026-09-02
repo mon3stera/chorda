@@ -71,6 +71,9 @@ pub(crate) type Disposable = BoxFuture<'static, ()>;
 #[derive(Clone)]
 pub(crate) struct ProvidedService {
     pub key: ServiceKey,
+    /// The realm the value was inserted into. A fiber may provide into a
+    /// derived realm, so this is not necessarily the fiber's own realm.
+    pub realm: RealmId,
 }
 
 /// How a tracked task behaves when its fiber is disposed.
@@ -467,7 +470,7 @@ pub(crate) async fn dispose_fiber(
         .clone();
 
     for provided in provides {
-        for dependent in kernel.dependents_of(&provided.key, shared.id) {
+        for dependent in kernel.dependents_of(provided.realm, &provided.key, shared.id) {
             if visited.insert(dependent.id) {
                 Box::pin(dispose_fiber(kernel.clone(), dependent, State::Disposed)).await;
             }

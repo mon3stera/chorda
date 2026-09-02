@@ -226,3 +226,86 @@ impl Ctx {
         next.run(input).await
     }
 }
+
+/// Declares pipeline extension points: per line, one marker type, its
+/// [`Pipeline`] impl, and a compile-time catalog registration. The doc
+/// comment becomes the marker's doc; the wire name after `=` becomes
+/// [`Pipeline::NAME`].
+///
+/// This is the inventory of what one plugin can intercept — a host binary
+/// that links several plugin crates can list every extension point they
+/// carry with [`pipeline_registrations`](crate::pipeline_registrations),
+/// without reading their source.
+///
+/// Equivalent to the manual form:
+///
+/// ```ignore
+/// pub struct AgentToolGate;
+///
+/// impl Pipeline for AgentToolGate {
+///     type Input = ToolCall;
+///
+///     type Output = ToolCallResult;
+///
+///     const NAME: &'static str = "h/agent/tool-gate";
+/// }
+///
+/// The input and output are ordinary types — fallible ones like
+/// `anyhow::Result<Option<T>>` need no special support. The arrow is `=>`
+/// rather than `->`: `macro_rules!` forbids `->` directly after a type
+/// fragment.
+/// ```
+///
+/// # Example
+///
+/// ```
+/// chorda::pipelines! {
+///     /// Wrapped around every greeting.
+///     pub GreetGate: u8 => u8 = "test/greet-gate";
+///
+///     /// A fallible point; the output type is an ordinary type.
+///     pub CheckGate: String => anyhow::Result<Option<String>> = "test/check-gate";
+/// }
+///
+/// # fn main() -> anyhow::Result<()> {
+/// use chorda::Pipeline;
+///
+/// assert_eq!(GreetGate::NAME, "test/greet-gate");
+///
+/// assert!(chorda::discover_pipeline_names().contains(&"test/check-gate".to_owned()));
+/// # Ok(())
+/// # }
+/// ```
+///
+/// Like [`register_plugin!`](crate::register_plugin), the submitting crate
+/// needs `inventory` in its dependencies for the registration to link.
+#[macro_export]
+macro_rules! pipelines {
+    ($(
+        $(#[$meta:meta])*
+        $vis:vis $name:ident : $input:ty => $output:ty = $point:expr
+    );* $(;)?) => {
+        $(
+            $(#[$meta])*
+            #[derive(Debug, Clone, Copy)]
+            $vis struct $name;
+
+            impl $crate::Pipeline for $name {
+                type Input = $input;
+
+                type Output = $output;
+
+                const NAME: &'static str = $point;
+            }
+
+            ::inventory::submit! {
+                $crate::PipelineRegistration {
+                    point: $point,
+                    marker: std::any::type_name::<$name>,
+                    input: std::any::type_name::<$input>,
+                    output: std::any::type_name::<$output>,
+                }
+            }
+        )*
+    };
+}
